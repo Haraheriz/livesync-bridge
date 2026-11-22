@@ -7,8 +7,12 @@ import { computeHash } from "./util.ts";
 import { getStoragePathComparisonKey, parseFilePath, type PathComparisonSettings } from "@vrtmrz/livesync-commonlib/storage";
 import { getPeerPathNormalizationVersion } from "./pathIdentity.ts";
 import { getPeerState } from "./PeerState.ts";
+import { serialized } from "octagonal-wheels/concurrency/lock";
 
-export type DispatchFun = (source: Peer, path: string, data: FileData | false) => Promise<void>;
+export interface FileChangeContext {
+    previousPath?: string;
+}
+export type DispatchFun = (source: Peer, path: string, data: FileData | false, context?: FileChangeContext) => Promise<void>;
 
 export interface PeerHealth {
     name: string;
@@ -93,6 +97,18 @@ export abstract class Peer {
     abstract get(path: FilePathWithPrefix): Promise<false | FileData>;
     abstract start(): Promise<void>;
     abstract stop(): Promise<void>;
+    currentPaths(_path: string): Promise<string[]> {
+        return Promise.resolve([]);
+    }
+    async deleteFrom(path: string, source: Peer): Promise<boolean> {
+        if ((await source.currentPaths(path)).includes(path)) return false;
+        return await this.delete(path);
+    }
+    async rename(previousPath: string, path: string, data: FileData): Promise<boolean> {
+        const result = await this.put(path, data);
+        if (result && previousPath !== path) await this.delete(previousPath);
+        return result;
+    }
     cache = new LRUCache<string, string>(300, 10000000, true);
     protected pathIdentityKey(path: string, policy?: PathComparisonSettings): string {
         const snapshot = policy ?? {
@@ -101,6 +117,33 @@ export abstract class Peer {
         };
         if (snapshot.pathNormalizationVersion === 0) return path;
         return getStoragePathComparisonKey(parseFilePath(path), snapshot);
+    }
+    protected readonly operationKey = crypto.randomUUID();
+    private pendingChanges = new Map<string, { hash: string; outgoing: boolean }>();
+    // Run `action` for a change unless the same content is already recorded for the
+    // path (or, for outgoing values, is already being delivered). The record is made
+    // only after `action` succeeds, so a failed delivery stays eligible for a retry.
+    // Paths are compared by their identity key, so NFC/NFD spellings of one file share a record.
+    protected async applyChange(path: string, data: FileData | false, action: () => Promise<boolean>,
+        options: { force?: boolean; suppressPendingEcho?: boolean; policy?: PathComparisonSettings } = {}) {
+        const key = this.pathIdentityKey(path, options.policy);
+        const hash = await computeHash(data === false ? ["\u0001Deleted"] : data.data);
+        // Outgoing values already exist in this backend. Their returning echo can
+        // finish without waiting on the original delivery. Two incoming saves wait
+        // for each other, so a failed write cannot acknowledge the later request.
+        const pending = this.pendingChanges.get(key);
+        if (!options.force && pending?.hash === hash && (options.suppressPendingEcho || pending.outgoing)) return false;
+        return await serialized(`${this.operationKey}:change:${key}`, async () => {
+            if (!options.force && this.cache.get(key) === hash) return false;
+            this.pendingChanges.set(key, { hash, outgoing: options.suppressPendingEcho ?? false });
+            try {
+                const result = await action();
+                this.cache.set(key, hash);
+                return result;
+            } finally {
+                this.pendingChanges.delete(key);
+            }
+        });
     }
     async isRepeating(path: string, data: FileData | false, policy?: PathComparisonSettings) {
         const key = this.pathIdentityKey(path, policy);

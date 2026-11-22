@@ -1,5 +1,5 @@
 import { Config, FileData } from "./types.ts";
-import { Peer, PeerHealth } from "./Peer.ts";
+import { FileChangeContext, Peer, PeerHealth } from "./Peer.ts";
 import { PeerStorage } from "./PeerStorage.ts";
 import { PeerCouchDB } from "./PeerCouchDB.ts";
 import { validatePeerPathIdentity } from "./pathIdentity.ts";
@@ -63,14 +63,17 @@ export class Hub {
         })();
     }
 
-    async dispatch(source: Peer, path: string, data: FileData | false) {
+    async dispatch(source: Peer, path: string, data: FileData | false, context?: FileChangeContext) {
         validatePeerPathIdentity(this.conf);
         for (const peer of this.peers) {
             if (peer !== source && (source.config.group ?? "") === (peer.config.group ?? "")) {
                 let ret = false;
                 try {
                     if (data === false) {
-                        ret = await peer.delete(path);
+                        // Skip the deletion when the source still has the path (see Peer.deleteFrom).
+                        ret = await peer.deleteFrom(path, source);
+                    } else if (context?.previousPath !== undefined) {
+                        ret = await peer.rename(context.previousPath, path, data);
                     } else {
                         ret = await peer.put(path, data);
                     }

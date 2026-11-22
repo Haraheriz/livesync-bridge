@@ -75,7 +75,11 @@ export class DenoStoragePathAccess {
         return join(this.rootPath, path);
     }
 
-    async *files(isIgnored: (path: StoragePath) => boolean): AsyncGenerator<StoragePath> {
+    /** List the files below `start` (the whole root by default), without entering ignored directories. */
+    async *files(
+        isIgnored: (path: StoragePath) => boolean,
+        start: StoragePath = "" as StoragePath,
+    ): AsyncGenerator<StoragePath> {
         const visitedDirectories = new Set<StoragePath>();
         const walk = async function* (
             access: DenoStoragePathAccess,
@@ -93,7 +97,7 @@ export class DenoStoragePathAccess {
             }
         };
 
-        yield* walk(this, "" as StoragePath);
+        yield* walk(this, start);
     }
 
     /** Return false only when a component is absent; callers then retain normal resolution behaviour. */
