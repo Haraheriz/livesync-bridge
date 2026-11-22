@@ -32,6 +32,12 @@ export interface PeerStorageConf extends PeerPathIdentityConf {
     rescanIntervalMinutes?: number;
     /** How many files are read and sent at the same time (default 10). */
     maxConcurrentSends?: number;
+    /**
+     * A change which could not be delivered to every peer is sent again after n times this many
+     * seconds, for n = 1..5 (30, 60, 90, 120 and 150 seconds by default), reading the file again
+     * each time. Afterwards it is left for the periodic rescan. 0 turns the retries off.
+     */
+    sendRetryIntervalSeconds?: number;
 }
 export interface PeerCouchDBConf extends DirectFileManipulatorOptions, PeerPathIdentityConf {
     /** Vault-root glob patterns for hidden i: files, selected in both directions, e.g. [".claude/**"]. */

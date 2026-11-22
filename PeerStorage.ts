@@ -32,6 +32,10 @@ const SEND_PROGRESS_INTERVAL_MS = 60_000;
 // Delay before rescanning a folder Chokidar reported as added (see onAddDir).
 export const NEW_DIR_RESCAN_DELAY_MS = 2_000;
 export const DEFAULT_RESCAN_INTERVAL_MINUTES = 60;
+// A send that failed is tried again 30, 60, 90, 120 and 150 seconds later (n times the interval).
+export const DEFAULT_SEND_RETRY_INTERVAL_SECONDS = 30;
+export const MAX_SEND_RETRIES = 5;
+const MAX_GIVE_UP_NOTICES = 20;
 
 // A short reason for a failure, for notices: the OS error code when there is one.
 function failureReason(ex: unknown): string {
@@ -497,6 +501,98 @@ export class PeerStorage extends Peer {
         return access ? path : this.toGlobalPath(path);
     }
 
+    // ---- Trying again after a failed send ----
+    //
+    // A change which could not be delivered to every peer (CouchDB restarting or unreachable, a
+    // chunk missing there) is not recorded as sent, so the periodic rescan would send it, but that
+    // can be an hour away. It is tried again 30, 60, 90, 120 and 150 seconds after the failure
+    // (n times sendRetryIntervalSeconds), each time reading the file as it is then. The waiting
+    // holds only the path and a timer, never a maxConcurrentSends slot: the slot is taken for the
+    // read and the send, when the timer fires. A deletion is retried the same way (it is checked
+    // again first, so a file which exists again is not deleted). After the fifth retry fails the
+    // path is left unrecorded for the periodic rescan, with a notice. A change which fails for
+    // being unreadable is not a failed send and is not retried here.
+    private sendRetries = new Map<string, { timer: ReturnType<typeof setTimeout>; deleted: boolean }>();
+    private gaveUp = new Set<string>();
+    private gaveUpNotices = 0;
+    private gaveUpReported = 0;
+
+    sendRetryIntervalMs(): number {
+        const seconds = this.config.sendRetryIntervalSeconds ?? DEFAULT_SEND_RETRY_INTERVAL_SECONDS;
+        return seconds > 0 ? seconds * 1000 : 0;
+    }
+
+    private sendFailed(pathSrc: string, deleted: boolean, retry: number, context: FileChangeContext | undefined, error: unknown) {
+        this.clearSendRetry(pathSrc);
+        if (this.stopped) return;
+        const interval = this.sendRetryIntervalMs();
+        if (interval <= 0) return;
+        const shown = this.toRelativePath(pathSrc);
+        const reason = error instanceof Error ? error.message : `${error}`;
+        if (retry >= MAX_SEND_RETRIES) {
+            this.gaveUp.add(pathSrc);
+            this.gaveUpNotices++;
+            if (this.gaveUpNotices <= MAX_GIVE_UP_NOTICES) {
+                this.normalLog(
+                    `Could not ${deleted ? "send the deletion of" : "send"} ${shown} after ${MAX_SEND_RETRIES} retries (${reason}); ` +
+                        `it is left for the periodic rescan.`,
+                    LOG_LEVEL_NOTICE,
+                );
+            } else if (this.gaveUpNotices === MAX_GIVE_UP_NOTICES + 1) {
+                this.normalLog(
+                    `More files could not be sent after the retries; they are not listed one by one. ` +
+                        `The periodic rescan reports how many are left.`,
+                    LOG_LEVEL_NOTICE,
+                );
+            }
+            return;
+        }
+        const attempt = retry + 1;
+        const waitMs = attempt * interval;
+        this.normalLog(
+            `Sending ${deleted ? "the deletion of " : ""}${shown} failed (${reason}); retry ${attempt} of ${MAX_SEND_RETRIES} in ${waitMs / 1000} s.`,
+        );
+        const generation = this.generation;
+        const timer = setTimeout(() => {
+            this.sendRetries.delete(pathSrc);
+            if (this.stopped || this.generation !== generation) return;
+            // Another start of this peer is not this one's business: only the generation which
+            // scheduled the retry may send it.
+            const isCurrent = () => !this.stopped && this.generation === generation;
+            const task = deleted
+                ? this.queueDeletion(pathSrc, isCurrent, attempt)
+                : this.queueDispatch(pathSrc, context, this.createPathAccess(), isCurrent, attempt);
+            // A failure is reported by queueTask, and schedules the next retry itself.
+            task.catch(() => {});
+        }, waitMs);
+        this.sendRetries.set(pathSrc, { timer, deleted });
+    }
+
+    // Delivered, so any retry for this path (and the give-up mark) is obsolete.
+    private sendSucceeded(pathSrc: string, deleted: boolean) {
+        this.clearSendRetry(pathSrc, deleted);
+        this.gaveUp.delete(pathSrc);
+    }
+
+    // Cancel the waiting retry of a path. With `deleted`, only a retry of that kind: a retry
+    // of the other kind is made moot by the path's state, and settles itself when it runs.
+    private clearSendRetry(pathSrc: string, deleted?: boolean) {
+        const waiting = this.sendRetries.get(pathSrc);
+        if (!waiting || (deleted !== undefined && waiting.deleted !== deleted)) return;
+        clearTimeout(waiting.timer);
+        this.sendRetries.delete(pathSrc);
+    }
+
+    private clearSendRetries() {
+        for (const { timer } of this.sendRetries.values()) clearTimeout(timer);
+        this.sendRetries.clear();
+    }
+
+    // How many paths wait for a retry (for tests and status).
+    sendRetriesWaiting(): number {
+        return this.sendRetries.size;
+    }
+
     dispatch(pathSrc: string, access = this.createPathAccess(), isCurrent = () => true): Promise<void> {
         if (!this.stopped) void this.queueDispatch(pathSrc, undefined, access, isCurrent);
         return Promise.resolve();
@@ -506,6 +602,7 @@ export class PeerStorage extends Peer {
         context?: FileChangeContext,
         access = this.createPathAccess(),
         isCurrent = () => true,
+        retry = 0,
     ): Promise<void> {
         const lP = this.toStoragePath(this.toLocalPath("."));
         const path = this.toPosixPath(relative(lP, pathSrc));
@@ -532,8 +629,11 @@ export class PeerStorage extends Peer {
                         this.knownFiles.add(await this.resolveStoragePath(path, access));
                     }
                 } catch (ex) {
+                    // Not a failed delivery, so no retry is waiting for it: the file is read again
+                    // by the next event or rescan.
+                    this.clearSendRetry(pathSrc, false);
                     if (ex instanceof Deno.errors.PermissionDenied && context?.previousPath === undefined) {
-                        // Not a failed delivery: nothing is sent, and it is read again by the next rescan.
+                        // Nothing is sent; it is read again by the next rescan.
                         this.noteUnreadable(pathSrc, false, ex);
                         return;
                     }
@@ -546,6 +646,7 @@ export class PeerStorage extends Peer {
                 }
                 this.clearUnreadable(pathSrc, false);
                 if (data === false) {
+                    this.clearSendRetry(pathSrc, false);
                     if (context?.previousPath !== undefined) {
                         throw new Error(`Rename target is no longer a file: ${path}`);
                     }
@@ -557,13 +658,21 @@ export class PeerStorage extends Peer {
                 // The content is remembered as handled, and its file record saved, only after every
                 // peer accepted it. A failed delivery therefore stays eligible for the next
                 // event or offline scan.
-                await this.applyChange(path, data, async () => {
-                    if (!isCurrent()) return false;
-                    this.sendLog(`${path} change detected`);
-                    await this.dispatchToHub(this, this.hubPath(path, access), data, hubContext);
-                    this.recordSent(path, data, access, isCurrent);
-                    return true;
-                }, { force: hubContext !== undefined, suppressPendingEcho: true, policy: this.pathPolicy(access) });
+                try {
+                    await this.applyChange(path, data, async () => {
+                        if (!isCurrent()) return false;
+                        this.sendLog(`${path} change detected`);
+                        await this.dispatchToHub(this, this.hubPath(path, access), data, hubContext);
+                        this.recordSent(path, data, access, isCurrent);
+                        return true;
+                    }, { force: hubContext !== undefined, suppressPendingEcho: true, policy: this.pathPolicy(access) });
+                } catch (ex) {
+                    // Not recorded as sent (applyChange records only after success), so the next
+                    // event or rescan sends it too; in addition it is tried again after a wait.
+                    this.sendFailed(pathSrc, false, retry, context, ex);
+                    throw ex;
+                }
+                this.sendSucceeded(pathSrc, false);
             });
         });
     }
@@ -571,7 +680,7 @@ export class PeerStorage extends Peer {
         if (this.stopped) return;
         await this.queueDeletion(pathSrc, isCurrent);
     }
-    private queueDeletion(pathSrc: string, isCurrent = () => true): Promise<void> {
+    private queueDeletion(pathSrc: string, isCurrent = () => true, retry = 0): Promise<void> {
         const lP = this.toStoragePath(this.toLocalPath("."));
         const path = this.toPosixPath(relative(lP, pathSrc));
         if (this.isOutsideBaseDir(path)) return Promise.resolve();
@@ -589,7 +698,11 @@ export class PeerStorage extends Peer {
             }
             const access = this.createPathAccess();
             // A real or emulated deletion can become stale while it waits behind a write.
-            if (!await this.isMissing(pathSrc, access) || !isCurrent()) return;
+            if (!await this.isMissing(pathSrc, access)) {
+                this.clearSendRetry(pathSrc, true);
+                return;
+            }
+            if (!isCurrent()) return;
             if (access) {
                 try {
                     const existing = await access.resolveExisting(parseFilePath(path));
@@ -607,14 +720,21 @@ export class PeerStorage extends Peer {
                     return;
                 }
             }
-            await this.withSendSlot(() =>
-                this.applyChange(path, false, async () => {
-                    if (!isCurrent()) return false;
-                    this.sendLog(`${path} delete detected`);
-                    await this.dispatchToHub(this, this.hubPath(path, access), false);
-                    return true;
-                }, { suppressPendingEcho: true, policy: this.pathPolicy(access) })
-            );
+            try {
+                await this.withSendSlot(() =>
+                    this.applyChange(path, false, async () => {
+                        if (!isCurrent()) return false;
+                        this.sendLog(`${path} delete detected`);
+                        await this.dispatchToHub(this, this.hubPath(path, access), false);
+                        return true;
+                    }, { suppressPendingEcho: true, policy: this.pathPolicy(access) })
+                );
+            } catch (ex) {
+                // The file stays known, so the next event on its folder reconciles it again.
+                this.sendFailed(pathSrc, true, retry, undefined, ex);
+                throw ex;
+            }
+            this.sendSucceeded(pathSrc, true);
             this.knownFiles.delete(resolve(pathSrc));
         });
     }
@@ -1080,7 +1200,8 @@ export class PeerStorage extends Peer {
 
     // Whether a send of this peer-relative path is queued or in progress.
     isSendPending(path: string): boolean {
-        return this.pendingTasks.has(this.toStoragePath(this.toLocalPath(path)));
+        const key = this.toStoragePath(this.toLocalPath(path));
+        return this.pendingTasks.has(key) || this.sendRetries.has(key);
     }
 
     // Returns the number of files queued for sending.
@@ -1096,7 +1217,8 @@ export class PeerStorage extends Peer {
                 if (!this.config.useChokidar) this.knownFiles.add(path);
                 // Asking again would only queue a second send behind the current one. A watcher
                 // event is not skipped: it reports an edit made after the queued send began.
-                if (this.pendingTasks.has(path)) {
+                // A file waiting for a retry is queued as well: asking again now would stack a second send on it.
+                if (this.pendingTasks.has(path) || this.sendRetries.has(path)) {
                     alreadyQueued++;
                     continue;
                 }
@@ -1126,6 +1248,13 @@ export class PeerStorage extends Peer {
             );
         }
         if (reason === "periodic") this.unreadableReported = this.unreadable.size;
+        if (reason === "periodic" && this.gaveUp.size > 0 && this.gaveUp.size !== this.gaveUpReported) {
+            this.normalLog(
+                `${this.gaveUp.size} file(s) could not be sent after the retries; this rescan sends them again.`,
+                LOG_LEVEL_NOTICE,
+            );
+        }
+        if (reason === "periodic") this.gaveUpReported = this.gaveUp.size;
         if (queued > 0) {
             this.normalLog(`Rescan (${reason}) queued ${queued} file(s) the watcher had not reported.`, LOG_LEVEL_NOTICE);
         }
@@ -1509,6 +1638,7 @@ export class PeerStorage extends Peer {
         this.watchDegraded = false;
         this.degradedScanDone = false;
         this.clearRescanTimers();
+        this.clearSendRetries();
         const watcher = this.watcher;
         this.watcher = undefined;
         const watcherDeno = this.watcherDeno;
