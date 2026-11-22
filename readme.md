@@ -324,10 +324,20 @@ below leaves hidden-file synchronisation disabled. To opt in, see
       "scanOfflineChanges": true,
       "ignore": ["**/.git/**", "node_modules/**"], // Glob patterns which are never synchronised. Omit to synchronise everything.
       "useChokidar":false, // Use Chokidar instead of Deno.watchFs; see filesystem watcher limitations.
+      "maxConcurrentSends": 10, // Files read and sent at the same time (default 10).
     }
   ]
 }
 ```
+
+## Large folders
+
+A watcher event or a scan can report every file of a large folder at once (tens of
+thousands of files when a folder becomes readable). A storage peer reads and sends at
+most `maxConcurrentSends` files at a time (default 10, the limit LiveSync itself uses
+for its bulk processing). The other files wait holding only their path; a file is read
+when its turn comes, so the newest content is sent. While files are waiting, the
+progress is logged once a minute.
 
 ## Filesystem watcher limitations
 

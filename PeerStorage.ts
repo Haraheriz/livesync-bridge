@@ -4,6 +4,7 @@ import { isPlainText } from "@vrtmrz/livesync-commonlib/compat/string_and_binary
 import { parse, format, relative, dirname, resolve, SEPARATOR, isAbsolute } from "@std/path";
 import { format as posixFormat, parse as posixParse } from "@std/path/posix";
 import { serialized, withLock } from "octagonal-wheels/concurrency/lock";
+import { Semaphore } from "octagonal-wheels/concurrency/semaphore_v2";
 import { DispatchFun, FileChangeContext, Peer, PeerHealth } from "./Peer.ts";
 import chokidar from "chokidar";
 import { minimatch } from "minimatch";
@@ -23,6 +24,11 @@ import {
 // for `includeInternal`. `dot` is needed because the directories which are worth
 // ignoring at all are usually dot-directories, such as `.git`.
 const IGNORE_MATCH_OPTIONS = { dot: true } as const;
+
+// How many files are read and sent at the same time. LiveSync itself limits its own bulk
+// processing to 10 (ReplicateResultProcessor, HiddenFileSync: Semaphore(10)).
+export const DEFAULT_MAX_CONCURRENT_SENDS = 10;
+const SEND_PROGRESS_INTERVAL_MS = 60_000;
 
 export class PeerStorage extends Peer {
     declare config: PeerStorageConf;
@@ -79,6 +85,72 @@ export class PeerStorage extends Peer {
     private async drain(): Promise<void> {
         while (this.pendingTasks.size) {
             await Promise.allSettled([...this.pendingTasks.values()].map((task) => task.promise));
+        }
+    }
+
+    // ---- Limiting how much is read and sent at once ----
+    // A watcher or a scan can report every file of a folder at once (66,000 files when a large
+    // folder became readable). If each report read its file and sent it immediately, all of them
+    // would be in memory together. At most maxConcurrentSends files are read and sent at a time;
+    // the others wait holding only their path, and the content is read when their turn comes,
+    // so the newest content is sent.
+    private sendSlots = Semaphore(DEFAULT_MAX_CONCURRENT_SENDS);
+    private sendSlotsLimit = DEFAULT_MAX_CONCURRENT_SENDS;
+    private sendsWaiting = 0;
+    private sendsActive = 0;
+    private sendsDone = 0;
+    private sendsDoneReported = 0;
+    private sendProgressTimer?: ReturnType<typeof setInterval>;
+
+    private ensureSendSlots() {
+        const limit = Math.max(1, Math.floor(this.config.maxConcurrentSends ?? DEFAULT_MAX_CONCURRENT_SENDS));
+        if (limit !== this.sendSlotsLimit) {
+            this.sendSlots = Semaphore(limit);
+            this.sendSlotsLimit = limit;
+        }
+    }
+
+    sendQueueStatus() {
+        return { waiting: this.sendsWaiting, done: this.sendsDone };
+    }
+
+    private reportSendProgress() {
+        const sent = this.sendsDone - this.sendsDoneReported;
+        this.sendsDoneReported = this.sendsDone;
+        if (this.sendsWaiting > 0 || sent > 0) {
+            this.normalLog(
+                `Sending: ${sent} file(s) handled in the last minute, ${this.sendsWaiting} waiting.`,
+                LOG_LEVEL_NOTICE,
+            );
+        }
+    }
+
+    private stopSendProgress() {
+        if (this.sendProgressTimer !== undefined) clearInterval(this.sendProgressTimer);
+        this.sendProgressTimer = undefined;
+    }
+
+    private async withSendSlot<T>(proc: () => Promise<T>): Promise<T> {
+        this.ensureSendSlots();
+        this.sendsWaiting++;
+        if (this.sendProgressTimer === undefined) {
+            this.sendProgressTimer = setInterval(() => this.reportSendProgress(), SEND_PROGRESS_INTERVAL_MS);
+        }
+        let release: (() => void) | undefined;
+        try {
+            release = await this.sendSlots.acquire();
+        } finally {
+            this.sendsWaiting--;
+        }
+        this.sendsActive++;
+        try {
+            return await proc();
+        } finally {
+            this.sendsActive--;
+            this.sendsDone++;
+            release();
+            // The progress line is only for bulk work; stop it once everything is done.
+            if (this.sendsWaiting === 0 && this.sendsActive === 0) this.stopSendProgress();
         }
     }
 
@@ -423,40 +495,46 @@ export class PeerStorage extends Peer {
         return this.queueTask(pathSrc, pathSrc, async () => {
             await delay(250);
             if (!isCurrent()) return;
-            let data: FileData | false;
-            try {
-                // Read after waiting so a completed incoming update or deletion
-                // supersedes the earlier watcher event's content.
-                data = await this.get(path, access);
+            // The file is read only when its turn comes, so waiting files hold nothing but their path.
+            await this.withSendSlot(async () => {
                 if (!isCurrent()) return;
-                if (data !== false && !this.config.useChokidar) {
-                    this.knownFiles.add(await this.resolveStoragePath(path, access));
+                let data: FileData | false;
+                try {
+                    // Read after waiting so a completed incoming update or deletion
+                    // supersedes the earlier watcher event's content.
+                    data = await this.get(path, access);
+                    if (!isCurrent()) return;
+                    if (data !== false && !this.config.useChokidar) {
+                        this.knownFiles.add(await this.resolveStoragePath(path, access));
+                    }
+                } catch (ex) {
+                    if (!(ex instanceof Deno.errors.NotFound)) {
+                        this.normalLog(`File read failed: ${path}`, LOG_LEVEL_NOTICE);
+                        Logger(ex, LOG_LEVEL_VERBOSE);
+                    }
+                    if (context?.previousPath !== undefined) throw ex;
+                    return;
                 }
-            } catch (ex) {
-                if (!(ex instanceof Deno.errors.NotFound)) {
-                    this.normalLog(`File read failed: ${path}`, LOG_LEVEL_NOTICE);
-                    Logger(ex, LOG_LEVEL_VERBOSE);
+                if (data === false) {
+                    if (context?.previousPath !== undefined) {
+                        throw new Error(`Rename target is no longer a file: ${path}`);
+                    }
+                    return;
                 }
-                if (context?.previousPath !== undefined) throw ex;
-                return;
-            }
-            if (data === false) {
-                if (context?.previousPath !== undefined) throw new Error(`Rename target is no longer a file: ${path}`);
-                return;
-            }
-            const hubContext = context?.previousPath === undefined
-                ? undefined
-                : { previousPath: this.hubPath(context.previousPath, access) };
-            // The content is remembered as handled, and its file record saved, only after every
-            // peer accepted it. A failed delivery therefore stays eligible for the next
-            // event or offline scan.
-            await this.applyChange(path, data, async () => {
-                if (!isCurrent()) return false;
-                this.sendLog(`${path} change detected`);
-                await this.dispatchToHub(this, this.hubPath(path, access), data, hubContext);
-                this.recordSent(path, data, access, isCurrent);
-                return true;
-            }, { force: hubContext !== undefined, suppressPendingEcho: true, policy: this.pathPolicy(access) });
+                const hubContext = context?.previousPath === undefined
+                    ? undefined
+                    : { previousPath: this.hubPath(context.previousPath, access) };
+                // The content is remembered as handled, and its file record saved, only after every
+                // peer accepted it. A failed delivery therefore stays eligible for the next
+                // event or offline scan.
+                await this.applyChange(path, data, async () => {
+                    if (!isCurrent()) return false;
+                    this.sendLog(`${path} change detected`);
+                    await this.dispatchToHub(this, this.hubPath(path, access), data, hubContext);
+                    this.recordSent(path, data, access, isCurrent);
+                    return true;
+                }, { force: hubContext !== undefined, suppressPendingEcho: true, policy: this.pathPolicy(access) });
+            });
         });
     }
     async dispatchDeleted(pathSrc: string, isCurrent = () => true) {
@@ -494,12 +572,14 @@ export class PeerStorage extends Peer {
                     return;
                 }
             }
-            await this.applyChange(path, false, async () => {
-                if (!isCurrent()) return false;
-                this.sendLog(`${path} delete detected`);
-                await this.dispatchToHub(this, this.hubPath(path, access), false);
-                return true;
-            }, { suppressPendingEcho: true, policy: this.pathPolicy(access) });
+            await this.withSendSlot(() =>
+                this.applyChange(path, false, async () => {
+                    if (!isCurrent()) return false;
+                    this.sendLog(`${path} delete detected`);
+                    await this.dispatchToHub(this, this.hubPath(path, access), false);
+                    return true;
+                }, { suppressPendingEcho: true, policy: this.pathPolicy(access) })
+            );
             this.knownFiles.delete(resolve(pathSrc));
         });
     }
@@ -1010,6 +1090,7 @@ export class PeerStorage extends Peer {
         }
         await this.closeChokidarWatcher(watcher);
         await this.drain();
+        this.stopSendProgress();
         await this.flushFileRecords();
     }
     override health(): PeerHealth {

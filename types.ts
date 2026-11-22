@@ -24,6 +24,8 @@ export interface PeerStorageConf extends PeerPathIdentityConf {
     /** Glob patterns for paths which are never synchronised, e.g. [".git/**"] */
     ignore?: string[];
     handleFilenameCaseSensitive?: boolean;
+    /** How many files are read and sent at the same time (default 10). */
+    maxConcurrentSends?: number;
 }
 export interface PeerCouchDBConf extends DirectFileManipulatorOptions, PeerPathIdentityConf {
     /** Vault-root glob patterns for hidden i: files, selected in both directions, e.g. [".claude/**"]. */
