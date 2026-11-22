@@ -22,6 +22,17 @@ function isNotFound(error: unknown): boolean {
     return error instanceof Deno.errors.NotFound;
 }
 
+/**
+ * Whether an error says that the directory could not be read (no permission, an I/O error), as
+ * opposed to an error about the names in it, such as two names of one path, which must be raised.
+ */
+export function isUnreadableDirectoryError(error: unknown): boolean {
+    if (error instanceof Deno.errors.PermissionDenied) return true;
+    if (!(error instanceof Error) || error instanceof SymbolicLinkStoragePathError) return false;
+    const code = (error as { code?: unknown }).code;
+    return typeof code === "string" && /^E[A-Z0-9]+$/.test(code);
+}
+
 /** Root-relative NFC path access for Deno-backed peer storage. */
 export class DenoStoragePathAccess {
     private readonly rootPath: string;
@@ -75,10 +86,20 @@ export class DenoStoragePathAccess {
         return join(this.rootPath, path);
     }
 
-    /** List the files below `start` (the whole root by default), without entering ignored directories. */
+    /**
+     * List the files below `start` (the whole root by default), without entering ignored directories.
+     * Without `onUnreadable`, a directory which cannot be listed ends the listing with its error.
+     * With it, a directory which cannot be read (see isUnreadableDirectoryError) is reported there and
+     * left out, and the listing goes on with the others; other errors still end the listing;
+     * `onReadable` is called for each directory which was listed.
+     */
     async *files(
         isIgnored: (path: StoragePath) => boolean,
         start: StoragePath = "" as StoragePath,
+        options: {
+            onUnreadable?: (directory: StoragePath, error: unknown) => void;
+            onReadable?: (directory: StoragePath) => void;
+        } = {},
     ): AsyncGenerator<StoragePath> {
         const visitedDirectories = new Set<StoragePath>();
         const walk = async function* (
@@ -88,8 +109,16 @@ export class DenoStoragePathAccess {
             if (visitedDirectories.has(directory)) return;
             visitedDirectories.add(directory);
 
-            const entries = await access.resolver.listResolvedDirectory(directory);
+            let entries;
+            try {
+                entries = await access.resolver.listResolvedDirectory(directory);
+            } catch (error) {
+                if (!options.onUnreadable || !isUnreadableDirectoryError(error)) throw error;
+                options.onUnreadable(directory, error);
+                return;
+            }
             if (entries === null) return;
+            options.onReadable?.(directory);
             for (const entry of entries) {
                 if (isIgnored(entry.path)) continue;
                 if (entry.kind === "file") yield entry.path;

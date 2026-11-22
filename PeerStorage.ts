@@ -33,6 +33,13 @@ const SEND_PROGRESS_INTERVAL_MS = 60_000;
 export const NEW_DIR_RESCAN_DELAY_MS = 2_000;
 export const DEFAULT_RESCAN_INTERVAL_MINUTES = 60;
 
+// A short reason for a failure, for notices: the OS error code when there is one.
+function failureReason(ex: unknown): string {
+    if (!(ex instanceof Error)) return "not readable";
+    const code = (ex as { code?: unknown }).code;
+    return typeof code === "string" ? code : ex.name;
+}
+
 export class PeerStorage extends Peer {
     declare config: PeerStorageConf;
     // The platform's path separator; a field so tests can simulate Windows on any OS.
@@ -54,6 +61,13 @@ export class PeerStorage extends Peer {
     private newDirTimers = new Map<string, ReturnType<typeof setTimeout>>();
     private fullScanRunning = false;
     private watcherReady = false;
+    // Set while Deno.watchFs is not running (it could not be started, or it failed): the peer then
+    // lives on its periodic rescans, which also try to start the watcher again.
+    private watchDegraded = false;
+    private lastWatchProblem = "";
+    private backgroundWatch?: Promise<void>;
+    // Reads one directory. A field so that tests can make a folder unreadable on any OS.
+    readDirectory: (path: string) => AsyncIterable<Deno.DirEntry> = (path) => Deno.readDir(path);
 
     // Run one file's work at a time. A request that arrives while the same key is
     // waiting replaces the waiting one, so a burst of events reads the file once.
@@ -171,6 +185,7 @@ export class PeerStorage extends Peer {
         return new DenoStoragePathAccess(
             this.toStoragePath(this.toLocalPath(".")),
             this.config.handleFilenameCaseSensitive ?? false,
+            (path) => this.readDirectory(path),
         );
     }
 
@@ -515,6 +530,11 @@ export class PeerStorage extends Peer {
                         this.knownFiles.add(await this.resolveStoragePath(path, access));
                     }
                 } catch (ex) {
+                    if (ex instanceof Deno.errors.PermissionDenied && context?.previousPath === undefined) {
+                        // Not a failed delivery: nothing is sent, and it is read again by the next rescan.
+                        this.noteUnreadable(pathSrc, false, ex);
+                        return;
+                    }
                     if (!(ex instanceof Deno.errors.NotFound)) {
                         this.normalLog(`File read failed: ${path}`, LOG_LEVEL_NOTICE);
                         Logger(ex, LOG_LEVEL_VERBOSE);
@@ -522,6 +542,7 @@ export class PeerStorage extends Peer {
                     if (context?.previousPath !== undefined) throw ex;
                     return;
                 }
+                this.clearUnreadable(pathSrc, false);
                 if (data === false) {
                     if (context?.previousPath !== undefined) {
                         throw new Error(`Rename target is no longer a file: ${path}`);
@@ -559,6 +580,11 @@ export class PeerStorage extends Peer {
         return this.queueTask(pathSrc, pathSrc, async () => {
             await delay(250);
             if (!isCurrent()) return;
+            // A file which cannot be read is not a file which is gone.
+            if (this.isUnderUnreadable(pathSrc)) {
+                this.debugLog(`${path} deletion skipped: it is under a path which cannot be read`);
+                return;
+            }
             const access = this.createPathAccess();
             // A real or emulated deletion can become stale while it waits behind a write.
             if (!await this.isMissing(pathSrc, access) || !isCurrent()) return;
@@ -825,11 +851,21 @@ export class PeerStorage extends Peer {
         const entries = new Map<string, string[]>();
         for (const path of event.paths) {
             try {
-                await Deno.stat(path);
+                try {
+                    await Deno.stat(path);
+                } catch (ex) {
+                    if (!(ex instanceof Deno.errors.NotFound)) throw ex;
+                    // It is gone: what could not be read in it is gone as well.
+                    this.forgetUnreadable(path);
+                }
+                entries.set(path, await this.currentEntries(this.toRelativePath(path), false, access));
             } catch (ex) {
-                if (!(ex instanceof Deno.errors.NotFound)) throw ex;
+                if (!(ex instanceof Deno.errors.PermissionDenied)) throw ex;
+                // The event is only a hint, and what it names cannot be inspected: send nothing,
+                // delete nothing, and let the rescans look at it again.
+                this.noteUnreadable(path, true, ex);
+                return;
             }
-            entries.set(path, await this.currentEntries(this.toRelativePath(path), false, access));
         }
         const oldPath = event.kind === "rename" && event.paths.length === 2
             ? event.paths.find((path) => !entries.get(path)!.includes(path))
@@ -857,7 +893,18 @@ export class PeerStorage extends Peer {
         emitChanges = true,
     ): Promise<void> {
         const currentFiles = new Set<string>();
-        for (const current of emitChanges ? await this.currentEntries(this.toRelativePath(path), false, access) : []) {
+        let currentEntries: string[] = [];
+        if (emitChanges) {
+            try {
+                currentEntries = await this.currentEntries(this.toRelativePath(path), false, access);
+            } catch (ex) {
+                if (!(ex instanceof Deno.errors.PermissionDenied)) throw ex;
+                // Not being able to look is not evidence that the files are gone: delete nothing.
+                this.noteUnreadable(path, true, ex);
+                return;
+            }
+        }
+        for (const current of currentEntries) {
             const relativePath = this.toRelativePath(current);
             if (this.isIgnored(relativePath)) continue;
             let stat: Deno.FileInfo;
@@ -865,6 +912,10 @@ export class PeerStorage extends Peer {
                 stat = await Deno.lstat(current);
             } catch (ex) {
                 if (ex instanceof Deno.errors.NotFound) continue;
+                if (ex instanceof Deno.errors.PermissionDenied) {
+                    this.noteUnreadable(current, true, ex);
+                    continue;
+                }
                 throw ex;
             }
             const files = stat.isFile ? [current] : stat.isDirectory ? this.listFiles(current, relativePath, access) : [];
@@ -881,8 +932,9 @@ export class PeerStorage extends Peer {
             await Promise.all(saves);
         }
         const prefix = path.endsWith(SEPARATOR) ? path : `${path}${SEPARATOR}`;
+        // A folder which could not be listed has no files to compare: its known files stay.
         const removed = [...this.knownFiles].filter((file) =>
-            (file === path || file.startsWith(prefix)) && !currentFiles.has(file)
+            (file === path || file.startsWith(prefix)) && !currentFiles.has(file) && !this.isUnderUnreadable(file)
         );
         await Promise.all(removed.map((file) => this.queueDeletion(file, isCurrent)));
     }
@@ -891,13 +943,17 @@ export class PeerStorage extends Peer {
     // when offline uploads are disabled and only the deletion inventory is needed.
     private async *listFiles(directory: string, prefix = "", access = this.createPathAccess()): AsyncGenerator<string> {
         if (access) {
-            for await (const path of access.files((path) => this.isIgnored(path), prefix as StoragePath)) {
+            const unreadable = {
+                onUnreadable: (path: StoragePath, error: unknown) => this.noteUnreadable(access.absolute(path), true, error),
+                onReadable: (path: StoragePath) => this.clearUnreadable(access.absolute(path), true),
+            };
+            for await (const path of access.files((path) => this.isIgnored(path), prefix as StoragePath, unreadable)) {
                 yield access.absolute(path);
             }
             return;
         }
         try {
-            for await (const entry of Deno.readDir(directory)) {
+            for await (const entry of this.readDirectory(directory)) {
                 const relativePath = prefix ? `${prefix}/${entry.name}` : entry.name;
                 if (this.isIgnored(relativePath)) {
                     this.debugLog(`${relativePath} ignored`);
@@ -907,11 +963,104 @@ export class PeerStorage extends Peer {
                 if (entry.isFile) yield path;
                 else if (entry.isDirectory) yield* this.listFiles(path, relativePath, access);
             }
+            this.clearUnreadable(directory, true);
         } catch (ex) {
             // A directory can disappear while the inventory is being read. Continue
             // with its siblings; queued watcher events reconcile any known children.
-            if (!(ex instanceof Deno.errors.NotFound)) throw ex;
+            if (ex instanceof Deno.errors.NotFound) return;
+            // A directory which cannot be read (no permission, an I/O error) is left out, with a
+            // notice, and the siblings are listed. It is tried again by the next scan.
+            this.noteUnreadable(directory, true, ex);
         }
+    }
+
+    // ---- Paths the bridge cannot read ----
+    //
+    // A folder or file which cannot be read is left out of the scans instead of stopping them,
+    // and the peer goes on with the rest. Each such path is reported once; every periodic rescan
+    // lists the whole folder again, so a path which became readable is found by it, its files are
+    // sent (their record of the last send is missing or differs), and the path is forgotten here.
+    // An unreadable path is never taken as a deleted one: no deletion is sent for a file at or
+    // below it.
+    private unreadable = new Map<string, { path: string; isDirectory: boolean }>();
+    private unreadableNotices = 0;
+    private unreadableReported = 0;
+    private foldersRecovered = false;
+    static readonly MAX_UNREADABLE_NOTICES = 20;
+
+    private noteUnreadable(path: string, isDirectory: boolean, reason?: unknown) {
+        const key = resolve(path);
+        if (this.unreadable.has(key)) return;
+        this.unreadable.set(key, { path: key, isDirectory });
+        this.unreadableNotices++;
+        if (this.unreadableNotices <= PeerStorage.MAX_UNREADABLE_NOTICES) {
+            this.normalLog(
+                `Cannot read ${isDirectory ? "folder" : "file"} ${key} (${failureReason(reason)}); skipped. ` +
+                    `Give the bridge's user read access to sync it; it is tried again at each rescan.`,
+                LOG_LEVEL_NOTICE,
+            );
+        } else if (this.unreadableNotices === PeerStorage.MAX_UNREADABLE_NOTICES + 1) {
+            this.normalLog(
+                `More paths cannot be read; they are not listed one by one. The periodic rescan reports how many.`,
+                LOG_LEVEL_NOTICE,
+            );
+        }
+        if (reason !== undefined) Logger(reason, LOG_LEVEL_VERBOSE);
+    }
+
+    // The path was read successfully: forget that it could not be.
+    private clearUnreadable(path: string, isDirectory: boolean) {
+        if (this.unreadable.size === 0) return;
+        if (!this.unreadable.delete(resolve(path))) return;
+        if (isDirectory) this.foldersRecovered = true;
+        this.normalLog(`${resolve(path)} can be read now.`, LOG_LEVEL_NOTICE);
+    }
+
+    private isUnderUnreadable(path: string): boolean {
+        if (this.unreadable.size === 0) return false;
+        const target = resolve(path);
+        for (const [key, entry] of this.unreadable) {
+            if (target === key) return true;
+            if (entry.isDirectory && target.startsWith(key.endsWith(SEPARATOR) ? key : `${key}${SEPARATOR}`)) return true;
+        }
+        return false;
+    }
+
+    // The path is known to be gone: forget it and what was recorded below it.
+    private forgetUnreadable(path: string) {
+        if (this.unreadable.size === 0) return;
+        const root = resolve(path);
+        const prefix = root.endsWith(SEPARATOR) ? root : `${root}${SEPARATOR}`;
+        for (const key of [...this.unreadable.keys()]) {
+            if (key === root || key.startsWith(prefix)) this.unreadable.delete(key);
+        }
+    }
+
+    // Forget the paths which have gone since (a path which is still unreadable stays).
+    private async pruneUnreadable() {
+        for (const [key, entry] of [...this.unreadable]) {
+            try {
+                await Deno.lstat(entry.path);
+            } catch (ex) {
+                if (ex instanceof Deno.errors.NotFound) this.unreadable.delete(key);
+            }
+        }
+    }
+
+    // The paths which could not be read at the last look.
+    unreadablePaths(): string[] {
+        return [...this.unreadable.values()].map((entry) => entry.path);
+    }
+
+    // A file whose state could not be inspected. Not found: it went meanwhile. Not readable: it
+    // is left out and reported. Anything else is not understood here.
+    private skipUnreadable(path: string, ex: unknown) {
+        if (ex instanceof Deno.errors.NotFound) return;
+        if (ex instanceof Deno.errors.PermissionDenied) {
+            this.noteUnreadable(path, false, ex);
+            return;
+        }
+        throw ex;
     }
 
     // ---- Rescans: recover changes the watcher did not report ----
@@ -957,13 +1106,24 @@ export class PeerStorage extends Peer {
                         queued++;
                     }
                 } catch (ex) {
-                    // The file may have been removed or replaced during the scan.
+                    // The file may have been removed or replaced during the scan, or cannot be inspected.
+                    if (ex instanceof Deno.errors.PermissionDenied) this.noteUnreadable(path, false, ex);
                     this.debugLog(`Rescan (${reason}) skipped ${ePath}: ${ex instanceof Error ? ex.message : ex}`);
                 }
             }
         } catch (ex) {
             this.normalLog(`Rescan (${reason}) of ${dir} stopped: ${ex instanceof Error ? ex.message : ex}`, LOG_LEVEL_NOTICE);
         }
+        await this.pruneUnreadable();
+        // Once per round, how many paths are still left out: the paths themselves were reported when
+        // they were found, and are not listed again.
+        if (reason === "periodic" && this.unreadable.size > 0 && this.unreadable.size !== this.unreadableReported) {
+            this.normalLog(
+                `${this.unreadable.size} path(s) cannot be read and are not synced; they are tried again at the next rescan.`,
+                LOG_LEVEL_NOTICE,
+            );
+        }
+        if (reason === "periodic") this.unreadableReported = this.unreadable.size;
         if (queued > 0) {
             this.normalLog(`Rescan (${reason}) queued ${queued} file(s) the watcher had not reported.`, LOG_LEVEL_NOTICE);
         }
@@ -1011,7 +1171,8 @@ export class PeerStorage extends Peer {
     private isScanReady(): boolean {
         return !!(
             (this.watcher && this.watcherReady) ||
-            (this.watcherDeno && this.readyDenoWatcher === this.watcherDeno)
+            (this.watcherDeno && this.readyDenoWatcher === this.watcherDeno) ||
+            this.watchDegraded
         );
     }
 
@@ -1026,70 +1187,195 @@ export class PeerStorage extends Peer {
             // Overlapping scans are skipped: so is a round that falls into the start-up scan.
             if (!this.fullScanRunning && this.isScanReady()) {
                 this.fullScanRunning = true;
+                const generation = this.generation;
                 try {
+                    // Without a watcher, each round starts by trying to start one again.
+                    if (this.watchDegraded) this.replaceDenoWatcher(generation);
                     await this.rescan(this.toStoragePath(this.toLocalPath(".")), "periodic");
+                    // A folder which could not be read before may not be watched by the running watcher.
+                    if (this.foldersRecovered) {
+                        this.foldersRecovered = false;
+                        if (this.watcherDeno && !this.watchDegraded) this.replaceDenoWatcher(generation);
+                    }
                 } finally {
                     this.fullScanRunning = false;
                 }
             }
-            if (!this.stopped && (this.watcher || this.watcherDeno)) this.scheduleFullRescan();
+            if (!this.stopped && (this.watcher || this.watcherDeno || this.watchDegraded)) this.scheduleFullRescan();
         }, ms);
     }
 
-    async startDenoFsWatch(scheduleRescan = false): Promise<void> {
-        const generation = ++this.generation;
-        if (this.watcherDeno || this.watcher || this.pendingTasks.size || this.closing) await this.closeAndDrain();
-        if (this.generation !== generation) return;
-        this.stopped = false;
-        if (scheduleRescan) this.scheduleFullRescan();
-        const lP = this.toStoragePath(this.toLocalPath("."));
-        const watcher = Deno.watchFs(lP, { recursive: true });
-        this.watcherDeno = watcher;
+    // ---- Deno.watchFs ----
+    //
+    // The OS may refuse to watch a tree (on Linux, a folder the bridge's user cannot read; also the
+    // inotify watch limit), and it is not known whether Deno.watchFs reports that when it is called
+    // or later through the events. Both are handled: the peer reports it and goes on with its
+    // periodic rescans, which try to start the watcher again. While there is no watcher, files which
+    // were added or changed are found by the rescans, but a deleted file is not noticed.
 
+    // Create the watcher, or report why not. The notice is given once per distinct reason.
+    private openDenoWatcher(lP: string): Deno.FsWatcher | undefined {
         try {
-            this.normalLog(`Scan offline changes: ${this.config.scanOfflineChanges ? "Enabled, now starting..." : "Disabled"}`);
-            // Watch before taking the inventory so removals during the scan are queued.
-            // Even with offline syncing disabled, remember existing files without sending
-            // their contents. Unchanged files must also be known for later parent removals.
-            const access = this.createPathAccess();
-            const isCurrent = access ? () => this.watcherDeno === watcher : () => true;
-            for await (const path of this.listFiles(lP, "", access)) {
-                if (this.watcherDeno !== watcher) return;
-                this.knownFiles.add(path);
-                if (this.config.scanOfflineChanges) {
-                    const ePath = this.toPosixPath(relative(lP, path));
-                    try {
-                        if (await this.isChangedExact(ePath, path, access)) {
-                            this.debugLog(`Offline changes detected: ${ePath}`);
-                            await this.dispatch(path, access, isCurrent);
-                        }
-                    } catch (ex) {
-                        if (!(ex instanceof Deno.errors.NotFound)) throw ex;
+            const watcher = Deno.watchFs(lP, { recursive: true });
+            this.lastWatchProblem = "";
+            return watcher;
+        } catch (ex) {
+            this.reportWatchProblem(`The folder watcher could not be started (${failureReason(ex)})`, ex);
+            return undefined;
+        }
+    }
+
+    private reportWatchProblem(what: string, ex: unknown) {
+        if (ex !== undefined) Logger(ex, LOG_LEVEL_VERBOSE);
+        const problem = `${what}${ex instanceof Error ? `: ${ex.message}` : ""}`;
+        if (problem === this.lastWatchProblem) return;
+        this.lastWatchProblem = problem;
+        const rescan = this.rescanIntervalMs() > 0
+            ? "Files are picked up by the periodic rescan only, and files deleted meanwhile are not noticed. The watcher is tried again at each rescan."
+            : "rescanIntervalMinutes is 0, so nothing is picked up until the peer is restarted.";
+        this.normalLog(`${problem}. ${rescan}`, LOG_LEVEL_NOTICE);
+    }
+
+    // The inventory of the files at start (and when a watcher is started again): remember the existing
+    // files, and, with sendChanges, send those which differ from the record of their last send.
+    // Returns false when the work became stale (the peer stopped or the watcher was replaced).
+    private async inventory(
+        lP: string,
+        isStale: () => boolean,
+        isCurrent: () => boolean,
+        sendChanges: boolean,
+    ): Promise<boolean> {
+        // Even with offline syncing disabled, remember existing files without sending
+        // their contents. Unchanged files must also be known for later parent removals.
+        const access = this.createPathAccess();
+        for await (const path of this.listFiles(lP, "", access)) {
+            if (isStale()) return false;
+            this.knownFiles.add(path);
+            if (sendChanges) {
+                const ePath = this.toPosixPath(relative(lP, path));
+                try {
+                    if (await this.isChangedExact(ePath, path, access)) {
+                        this.debugLog(`Offline changes detected: ${ePath}`);
+                        await this.dispatch(path, access, isCurrent);
                     }
+                } catch (ex) {
+                    this.skipUnreadable(path, ex);
                 }
             }
-            if (this.watcherDeno !== watcher) return;
-            // Records of the files sent by this scan are saved before the scan is called done.
-            await this.flushFileRecords();
+        }
+        if (isStale()) return false;
+        // Records of the files sent by this scan are saved before the scan is called done.
+        await this.flushFileRecords();
+        return true;
+    }
+
+    // Run the watcher: take the inventory, then handle its events until it ends. Whatever ends the
+    // events other than stop() leaves the peer on its periodic rescans. A failure of the inventory
+    // (a configuration problem such as two names of one path, not an unreadable folder) is thrown
+    // to the caller of start() when `foreground` is set, as before; a watcher started again by a
+    // rescan has no caller to receive it, so it is reported and the peer stays on its rescans.
+    private async runDenoWatcher(
+        watcher: Deno.FsWatcher,
+        lP: string,
+        generation: number,
+        sendChanges: boolean,
+        foreground: boolean,
+    ): Promise<void> {
+        this.watcherDeno = watcher;
+        this.watchDegraded = false;
+        const isStale = () => this.watcherDeno !== watcher;
+        const isCurrent = getPeerPathNormalizationVersion(this.config) === 1 ? () => this.watcherDeno === watcher : () => true;
+        let failure: unknown;
+        let inventoryFailed = false;
+        try {
+            // Watch before taking the inventory so removals during the scan are queued.
+            try {
+                if (!await this.inventory(lP, isStale, isCurrent, sendChanges)) return;
+            } catch (ex) {
+                inventoryFailed = true;
+                throw ex;
+            }
             this.readyDenoWatcher = watcher;
             for await (const event of watcher) {
                 if (this.watcherDeno !== watcher) break;
                 this.processFile(event);
             }
+        } catch (ex) {
+            if (inventoryFailed && foreground) throw ex;
+            failure = ex;
         } finally {
             if (this.readyDenoWatcher === watcher) this.readyDenoWatcher = undefined;
-            if (this.watcherDeno === watcher) {
-                this.watcherDeno = undefined;
-                this.clearRescanTimers();
-            }
+            const ended = this.watcherDeno === watcher;
+            if (ended) this.watcherDeno = undefined;
             try {
                 watcher.close();
             } catch (ex) {
                 // The watcher can already be closed by stop() or a concurrent start().
                 Logger(ex, LOG_LEVEL_VERBOSE);
             }
+            if (ended && inventoryFailed && foreground) {
+                this.clearRescanTimers();
+            } else if (ended && !this.stopped && this.generation === generation) {
+                // The watcher ended without stop() (the OS reported an error, or the events stopped):
+                // keep the peer alive on its rescans.
+                this.watchDegraded = true;
+                this.reportWatchProblem(
+                    failure === undefined ? "The folder watcher ended" : `The folder watcher failed (${failureReason(failure)})`,
+                    failure,
+                );
+                if (this.rescanTimer === undefined && this.rescanWanted) this.scheduleFullRescan();
+            }
         }
+    }
 
+    // Try to start the watcher again while the peer is running without one (or to replace the
+    // running one, e.g. after a folder became readable). The new watcher takes over at once; the old
+    // one is closed. Returns whether a new watcher was started.
+    private replaceDenoWatcher(generation: number): boolean {
+        if (this.stopped || this.generation !== generation || this.config.useChokidar) return false;
+        const lP = this.toStoragePath(this.toLocalPath("."));
+        const watcher = this.openDenoWatcher(lP);
+        if (!watcher) return false;
+        const previous = this.watcherDeno;
+        const wasDegraded = this.watchDegraded;
+        // The new watcher is registered synchronously (runDenoWatcher sets watcherDeno before it waits).
+        const running: Promise<void> = this.runDenoWatcher(watcher, lP, generation, false, false).finally(() => {
+            if (this.backgroundWatch === running) this.backgroundWatch = undefined;
+        });
+        this.backgroundWatch = running;
+        if (previous) {
+            try {
+                previous.close();
+            } catch (ex) {
+                Logger(ex, LOG_LEVEL_VERBOSE);
+            }
+        }
+        if (wasDegraded) this.normalLog("The folder watcher is running again.", LOG_LEVEL_NOTICE);
+        return true;
+    }
+
+    private rescanWanted = false;
+
+    async startDenoFsWatch(scheduleRescan = false): Promise<void> {
+        const generation = ++this.generation;
+        if (this.watcherDeno || this.watcher || this.pendingTasks.size || this.closing) await this.closeAndDrain();
+        if (this.generation !== generation) return;
+        this.stopped = false;
+        this.watchDegraded = false;
+        this.rescanWanted = scheduleRescan;
+        if (scheduleRescan) this.scheduleFullRescan();
+        const lP = this.toStoragePath(this.toLocalPath("."));
+        const watcher = this.openDenoWatcher(lP);
+        this.normalLog(`Scan offline changes: ${this.config.scanOfflineChanges ? "Enabled, now starting..." : "Disabled"}`);
+        if (watcher) {
+            await this.runDenoWatcher(watcher, lP, generation, this.config.scanOfflineChanges === true, true);
+            return;
+        }
+        // No watcher: take the inventory anyway, and live on the rescans.
+        const isStale = () => this.stopped || this.generation !== generation;
+        if (await this.inventory(lP, isStale, () => !isStale(), this.config.scanOfflineChanges === true)) {
+            this.watchDegraded = true;
+        }
     }
     async start() {
         // For addressing Deno's and chokidar's compatibility issues (especially on Windows), we use Deno's fs watcher as the primary watcher.
@@ -1214,6 +1500,7 @@ export class PeerStorage extends Peer {
     // Stop accepting events, close the watchers, and wait for the work already accepted.
     private async closeWatchers(): Promise<void> {
         this.stopped = true;
+        this.watchDegraded = false;
         this.clearRescanTimers();
         const watcher = this.watcher;
         this.watcher = undefined;
@@ -1230,6 +1517,7 @@ export class PeerStorage extends Peer {
             }
         }
         await this.closeChokidarWatcher(watcher);
+        await this.backgroundWatch;
         await this.drain();
         this.stopSendProgress();
         await this.flushFileRecords();
@@ -1242,6 +1530,14 @@ export class PeerStorage extends Peer {
         // No remote backend (backendUp always true). A storage peer still doing its
         // initial offline scan is "starting", not yet healthy, so the base restart
         // logic won't flag it — only a watcher that dies after being healthy counts.
-        return { name: this.config.name, type: "storage", ok, detail: ok ? "watching" : "starting", backendUp: true, restartWorthy: false };
+        const detail = ok ? "watching" : this.watchDegraded ? "rescan only (no watcher)" : "starting";
+        return { name: this.config.name, type: "storage", ok, detail, backendUp: true, restartWorthy: false };
+    }
+    // Without a watcher the peer is not healthy in the sense of "watching", but it is working on its
+    // rescans, and a restart would not help while the OS keeps refusing the watch (it would only
+    // repeat the inventory of the whole folder), so it is never restart-worthy in that state.
+    override async probeHealth(): Promise<PeerHealth> {
+        if (this.watchDegraded) return this.health();
+        return await super.probeHealth();
     }
 }
