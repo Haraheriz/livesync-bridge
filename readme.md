@@ -325,6 +325,7 @@ below leaves hidden-file synchronisation disabled. To opt in, see
       "ignore": ["**/.git/**", "node_modules/**"], // Glob patterns which are never synchronised. Omit to synchronise everything.
       "useChokidar":false, // Use Chokidar instead of Deno.watchFs; see filesystem watcher limitations.
       "maxConcurrentSends": 10, // Files read and sent at the same time (default 10).
+      "rescanIntervalMinutes": 60, // Periodic rescan for missed changes (default 60, randomised to 3/4..5/4; 0 disables).
     }
   ]
 }
@@ -338,6 +339,27 @@ most `maxConcurrentSends` files at a time (default 10, the limit LiveSync itself
 for its bulk processing). The other files wait holding only their path; a file is read
 when its turn comes, so the newest content is sent. While files are waiting, the
 progress is logged once a minute.
+
+## Rescans
+
+A watcher can miss files. Chokidar reads a new folder before it starts watching it,
+so files moved into the folder in between are never reported, and `Deno.watchFs`
+can drop events. A storage peer therefore also rescans:
+
+- **Periodically** (both watchers): every `rescanIntervalMinutes` (default 60; the
+  actual interval is randomised between 3/4 and 5/4 of it; 0 disables) the whole
+  folder is rescanned. A rescan sends only files whose modification time and size
+  differ from the last record of a successful send (the rule of the start-up offline
+  scan), skips files whose send is already queued or running, and is skipped while
+  another rescan or the start-up scan is still running. Ignored folders are not entered.
+- **After a folder appears** (Chokidar only): 2 seconds after Chokidar reports a new
+  folder (once the watcher is ready), that folder is rescanned.
+
+A rescan never deletes anything: a file that is missing is not evidence of a deletion.
+With `Deno.watchFs`, deletions and moves of folders are handled by the event
+reconciliation described below, which scans the notified folder immediately; the
+periodic rescan only adds what the events missed. A file is recorded as sent only
+after every peer accepted it, so a failed delivery is picked up by the next rescan.
 
 ## Filesystem watcher limitations
 

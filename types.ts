@@ -24,6 +24,12 @@ export interface PeerStorageConf extends PeerPathIdentityConf {
     /** Glob patterns for paths which are never synchronised, e.g. [".git/**"] */
     ignore?: string[];
     handleFilenameCaseSensitive?: boolean;
+    /**
+     * Periodic rescan of the whole folder as a safety net for changes the watcher missed, in
+     * minutes. The actual interval varies between 3/4 and 5/4 of this value. 0 disables it.
+     * Default: 60. A rescan sends changed files only and never infers deletions.
+     */
+    rescanIntervalMinutes?: number;
     /** How many files are read and sent at the same time (default 10). */
     maxConcurrentSends?: number;
 }

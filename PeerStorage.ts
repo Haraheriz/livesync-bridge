@@ -29,6 +29,9 @@ const IGNORE_MATCH_OPTIONS = { dot: true } as const;
 // processing to 10 (ReplicateResultProcessor, HiddenFileSync: Semaphore(10)).
 export const DEFAULT_MAX_CONCURRENT_SENDS = 10;
 const SEND_PROGRESS_INTERVAL_MS = 60_000;
+// Delay before rescanning a folder Chokidar reported as added (see onAddDir).
+export const NEW_DIR_RESCAN_DELAY_MS = 2_000;
+export const DEFAULT_RESCAN_INTERVAL_MINUTES = 60;
 
 export class PeerStorage extends Peer {
     declare config: PeerStorageConf;
@@ -47,6 +50,10 @@ export class PeerStorage extends Peer {
     private closing?: Promise<void>;
     private pendingEvents = new Map<string, Deno.FsEvent>();
     private pendingTasks = new Map<string, { next?: () => Promise<void>; promise: Promise<void> }>();
+    private rescanTimer?: ReturnType<typeof setTimeout>;
+    private newDirTimers = new Map<string, ReturnType<typeof setTimeout>>();
+    private fullScanRunning = false;
+    private watcherReady = false;
 
     // Run one file's work at a time. A request that arrives while the same key is
     // waiting replaces the waiting one, so a burst of events reads the file once.
@@ -907,11 +914,134 @@ export class PeerStorage extends Peer {
         }
     }
 
-    async startDenoFsWatch(): Promise<void> {
+    // ---- Rescans: recover changes the watcher did not report ----
+    //
+    // A watcher can miss files: Chokidar reads a new folder before it starts watching it, so
+    // files moved into the folder in between are never reported (a folder of 100 files moved
+    // into a just-created folder was missed entirely), and Deno.watchFs can drop events. Files
+    // in a new folder are therefore picked up by rescanning that folder shortly after it
+    // appears (Chokidar only; Deno.watchFs folder events are reconciled by processFile()), and
+    // anything else by a periodic rescan of the whole vault, as file synchronisers commonly do.
+    //
+    // A rescan sends only the files whose mtime and size differ from what was last sent
+    // (the rule of the start-up offline scan) and skips the files whose send is already
+    // queued or running. It never deletes: a missing file is not evidence of a deletion.
+
+    // Whether a send of this peer-relative path is queued or in progress.
+    isSendPending(path: string): boolean {
+        return this.pendingTasks.has(this.toStoragePath(this.toLocalPath(path)));
+    }
+
+    // Returns the number of files queued for sending.
+    async rescan(dir: string, reason: string): Promise<number> {
+        const generation = this.generation;
+        const isCurrent = () => !this.stopped && this.generation === generation;
+        const access = this.createPathAccess();
+        let queued = 0;
+        let alreadyQueued = 0;
+        try {
+            for await (const path of this.listFiles(dir, this.toRelativePath(dir), access)) {
+                if (!isCurrent()) break;
+                if (!this.config.useChokidar) this.knownFiles.add(path);
+                // Asking again would only queue a second send behind the current one. A watcher
+                // event is not skipped: it reports an edit made after the queued send began.
+                if (this.pendingTasks.has(path)) {
+                    alreadyQueued++;
+                    continue;
+                }
+                const ePath = this.toRelativePath(path);
+                try {
+                    if (await this.isChangedExact(ePath, path, access)) {
+                        this.debugLog(`Rescan (${reason}) found: ${ePath}`);
+                        await this.dispatch(path, access, isCurrent);
+                        queued++;
+                    }
+                } catch (ex) {
+                    // The file may have been removed or replaced during the scan.
+                    this.debugLog(`Rescan (${reason}) skipped ${ePath}: ${ex instanceof Error ? ex.message : ex}`);
+                }
+            }
+        } catch (ex) {
+            this.normalLog(`Rescan (${reason}) of ${dir} stopped: ${ex instanceof Error ? ex.message : ex}`, LOG_LEVEL_NOTICE);
+        }
+        if (queued > 0) {
+            this.normalLog(`Rescan (${reason}) queued ${queued} file(s) the watcher had not reported.`, LOG_LEVEL_NOTICE);
+        }
+        if (alreadyQueued > 0) {
+            this.debugLog(`Rescan (${reason}) left ${alreadyQueued} file(s) already queued for sending.`);
+        }
+        return queued;
+    }
+
+    // Chokidar reported a folder as added. The first scan after the watcher is ready covers
+    // the folders that exist at start, so earlier events are ignored.
+    onAddDir(path: string) {
+        if (!this.watcherReady || this.stopped) return;
+        const relativePath = this.toRelativePath(path);
+        if (!relativePath || this.isOutsideBaseDir(relativePath) || this.isIgnored(relativePath)) return;
+        const previous = this.newDirTimers.get(path);
+        if (previous !== undefined) clearTimeout(previous);
+        this.newDirTimers.set(
+            path,
+            setTimeout(() => {
+                this.newDirTimers.delete(path);
+                if (this.stopped) return;
+                void this.rescan(path, "new folder");
+            }, NEW_DIR_RESCAN_DELAY_MS),
+        );
+    }
+
+    // 0 disables the periodic rescan.
+    rescanIntervalMs(): number {
+        const minutes = this.config.rescanIntervalMinutes ?? DEFAULT_RESCAN_INTERVAL_MINUTES;
+        if (!(minutes > 0)) return 0;
+        // Randomise between 3/4 and 5/4 of the interval so that peers do not scan at the same moment.
+        return minutes * 60_000 * (0.75 + Math.random() * 0.5);
+    }
+
+    // Without a watcher there is nothing to complement: drop the timers of the rescans.
+    private clearRescanTimers() {
+        this.watcherReady = false;
+        if (this.rescanTimer !== undefined) clearTimeout(this.rescanTimer);
+        this.rescanTimer = undefined;
+        for (const timer of this.newDirTimers.values()) clearTimeout(timer);
+        this.newDirTimers.clear();
+    }
+
+    private isScanReady(): boolean {
+        return !!(
+            (this.watcher && this.watcherReady) ||
+            (this.watcherDeno && this.readyDenoWatcher === this.watcherDeno)
+        );
+    }
+
+    scheduleFullRescan() {
+        if (this.rescanTimer !== undefined) clearTimeout(this.rescanTimer);
+        this.rescanTimer = undefined;
+        const ms = this.rescanIntervalMs();
+        if (ms <= 0) return;
+        this.rescanTimer = setTimeout(async () => {
+            this.rescanTimer = undefined;
+            if (this.stopped) return;
+            // Overlapping scans are skipped: so is a round that falls into the start-up scan.
+            if (!this.fullScanRunning && this.isScanReady()) {
+                this.fullScanRunning = true;
+                try {
+                    await this.rescan(this.toStoragePath(this.toLocalPath(".")), "periodic");
+                } finally {
+                    this.fullScanRunning = false;
+                }
+            }
+            if (!this.stopped && (this.watcher || this.watcherDeno)) this.scheduleFullRescan();
+        }, ms);
+    }
+
+    async startDenoFsWatch(scheduleRescan = false): Promise<void> {
         const generation = ++this.generation;
         if (this.watcherDeno || this.watcher || this.pendingTasks.size || this.closing) await this.closeAndDrain();
         if (this.generation !== generation) return;
         this.stopped = false;
+        if (scheduleRescan) this.scheduleFullRescan();
         const lP = this.toStoragePath(this.toLocalPath("."));
         const watcher = Deno.watchFs(lP, { recursive: true });
         this.watcherDeno = watcher;
@@ -950,6 +1080,7 @@ export class PeerStorage extends Peer {
             if (this.readyDenoWatcher === watcher) this.readyDenoWatcher = undefined;
             if (this.watcherDeno === watcher) {
                 this.watcherDeno = undefined;
+                this.clearRescanTimers();
             }
             try {
                 watcher.close();
@@ -963,7 +1094,7 @@ export class PeerStorage extends Peer {
     async start() {
         // For addressing Deno's and chokidar's compatibility issues (especially on Windows), we use Deno's fs watcher as the primary watcher.
         if (!this.config.useChokidar) {
-            await this.startDenoFsWatch();
+            await this.startDenoFsWatch(true);
             return;
         }
 
@@ -971,6 +1102,8 @@ export class PeerStorage extends Peer {
         if (this.watcher || this.watcherDeno || this.pendingTasks.size || this.closing) await this.closeAndDrain();
         if (this.generation !== generation) return;
         this.stopped = false;
+        this.watcherReady = false;
+        this.scheduleFullRescan();
         const lP = this.toStoragePath(this.toLocalPath("."));
         this.normalLog(`Scan offline changes: ${this.config.scanOfflineChanges ? "Enabled, now starting..." : "Disabled"}`);
         const access = this.createPathAccess();
@@ -988,9 +1121,16 @@ export class PeerStorage extends Peer {
         this.watcher = watcher;
         const isCurrent = access ? () => this.watcher === watcher : () => true;
 
+        watcher.on("ready", () => {
+            if (this.watcher === watcher) this.watcherReady = true;
+        });
+        watcher.on("addDir", (path: string) => {
+            if (this.watcher === watcher) this.onAddDir(path);
+        });
         watcher.on("error", (ex) => {
             if (this.watcher !== watcher) return;
             this.watcher = undefined;
+            this.clearRescanTimers();
             if (this.readyChokidarWatcher === watcher) this.readyChokidarWatcher = undefined;
             Logger(ex, LOG_LEVEL_NOTICE);
             void this.closeChokidarWatcher(watcher);
@@ -1074,6 +1214,7 @@ export class PeerStorage extends Peer {
     // Stop accepting events, close the watchers, and wait for the work already accepted.
     private async closeWatchers(): Promise<void> {
         this.stopped = true;
+        this.clearRescanTimers();
         const watcher = this.watcher;
         this.watcher = undefined;
         const watcherDeno = this.watcherDeno;
