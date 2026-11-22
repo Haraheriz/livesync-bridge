@@ -64,6 +64,8 @@ export class PeerStorage extends Peer {
     // Set while Deno.watchFs is not running (it could not be started, or it failed): the peer then
     // lives on its periodic rescans, which also try to start the watcher again.
     private watchDegraded = false;
+    // The inventory taken at start without a watcher is done: rescans may begin.
+    private degradedScanDone = false;
     private lastWatchProblem = "";
     private backgroundWatch?: Promise<void>;
     // Reads one directory. A field so that tests can make a folder unreadable on any OS.
@@ -1172,7 +1174,7 @@ export class PeerStorage extends Peer {
         return !!(
             (this.watcher && this.watcherReady) ||
             (this.watcherDeno && this.readyDenoWatcher === this.watcherDeno) ||
-            this.watchDegraded
+            (this.watchDegraded && this.degradedScanDone)
         );
     }
 
@@ -1319,6 +1321,7 @@ export class PeerStorage extends Peer {
                 // The watcher ended without stop() (the OS reported an error, or the events stopped):
                 // keep the peer alive on its rescans.
                 this.watchDegraded = true;
+                this.degradedScanDone = true;
                 this.reportWatchProblem(
                     failure === undefined ? "The folder watcher ended" : `The folder watcher failed (${failureReason(failure)})`,
                     failure,
@@ -1371,10 +1374,13 @@ export class PeerStorage extends Peer {
             await this.runDenoWatcher(watcher, lP, generation, this.config.scanOfflineChanges === true, true);
             return;
         }
-        // No watcher: take the inventory anyway, and live on the rescans.
+        // No watcher: take the inventory anyway, and live on the rescans. The mode is set first, so
+        // that a rescan timer which fires during the inventory still reschedules itself.
+        this.watchDegraded = true;
+        this.degradedScanDone = false;
         const isStale = () => this.stopped || this.generation !== generation;
         if (await this.inventory(lP, isStale, () => !isStale(), this.config.scanOfflineChanges === true)) {
-            this.watchDegraded = true;
+            if (!isStale()) this.degradedScanDone = true;
         }
     }
     async start() {
@@ -1501,6 +1507,7 @@ export class PeerStorage extends Peer {
     private async closeWatchers(): Promise<void> {
         this.stopped = true;
         this.watchDegraded = false;
+        this.degradedScanDone = false;
         this.clearRescanTimers();
         const watcher = this.watcher;
         this.watcher = undefined;

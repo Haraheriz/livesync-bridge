@@ -366,6 +366,41 @@ Deno.test("when Deno.watchFs cannot start, the peer lives on its rescans and sta
     assertEquals(watchers.every((watcher) => watcher.closed), true, "stop() closed the watcher which was started again");
 });
 
+Deno.test("without a watcher, a rescan timer which fires during the start-up inventory does not end the rescans", async () => {
+    const original = Deno.watchFs;
+    Deno.watchFs = (() => {
+        throw permissionDenied("vault/locked");
+    }) as typeof Deno.watchFs;
+    const dir = await makeVault();
+    const { peer, sent } = makePeer(dir, { rescanIntervalMinutes: 0.001 });
+    // The inventory of the root takes a while.
+    const release = Promise.withResolvers<void>();
+    const readDirectory = peer.readDirectory;
+    peer.readDirectory = (path) => {
+        if (resolve(path) !== resolve(dir)) return readDirectory(path);
+        return {
+            async *[Symbol.asyncIterator]() {
+                await release.promise;
+                yield* readDirectory(path);
+            },
+        };
+    };
+    try {
+        const starting = peer.start();
+        await sleep(400); // the rescan timer fires several times meanwhile: nothing is ready yet
+        release.resolve();
+        await starting;
+        await waitFor(() => sorted(sent) === "locked/a.md,locked/sub/b.md,ok.md,open/c.md", "the start-up scan sent the files");
+        await Deno.writeTextFile(join(dir, "open", "new.md"), "new");
+        await waitFor(() => sent.includes("open/new.md"), "a periodic rescan still runs");
+    } finally {
+        release.resolve();
+        await peer.stop();
+        Deno.watchFs = original;
+        await Deno.remove(dir, { recursive: true });
+    }
+});
+
 Deno.test("when the watcher's events fail, the peer lives on its rescans and starts the watcher again", async () => {
     const original = Deno.watchFs;
     const watchers: FakeDenoWatcher[] = [];
