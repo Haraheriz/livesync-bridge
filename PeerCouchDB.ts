@@ -14,6 +14,7 @@ import { assertPeerMatchesRemoteCase, getPeerPathNormalizationVersion } from "./
 import {
     createBinaryBlob,
     createTextBlob,
+    delay,
     getDocData,
     isDocContentSame,
     unique,
@@ -30,6 +31,9 @@ type ResolvedCouchDBPath = {
     databasePath: FilePathWithPrefix;
     internal: boolean;
 };
+
+// Chunk IDs looked up per request when a saved note is confirmed.
+const CHUNK_CHECK_BATCH = 500;
 
 type PeerCouchDBRuntimeOptions = {
     disableCheckingConfigMismatch?: boolean;
@@ -240,7 +244,14 @@ export class PeerCouchDB extends Peer {
             const info = { ctime: data.ctime, mtime: data.mtime, size: data.size };
             const saveData = data.data instanceof Uint8Array ? createBinaryBlob(data.data) : createTextBlob(data.data);
             if (old && !old.deleted && old.path === path && Math.abs(this.compareDate(info, old)) < 3600) {
-                const oldDoc = await this.man.getByMeta(old);
+                // A stored copy which cannot be loaded (its chunks are missing) is not the same
+                // content: save over it, instead of failing on every retry of this change.
+                let oldDoc: ManipulatorReadyEntry | undefined;
+                try {
+                    oldDoc = await this.man.getByMeta(old);
+                } catch (ex) {
+                    this.debugLog(`The stored copy of ${path} could not be loaded; saving over it: ${ex instanceof Error ? ex.message : ex}`);
+                }
                 if (oldDoc && "data" in oldDoc) {
                     const body = oldDoc.type === "plain" ? createTextBlob(oldDoc.data)
                         : createBinaryBlob(new Uint8Array(decodeBinary(oldDoc.data)));
@@ -248,9 +259,51 @@ export class PeerCouchDB extends Peer {
                 }
             }
             if (!await this.man.put(path, saveData, info, type)) throw new Error(`Save failed: ${path}`);
+            // put() can report success while a chunk write failed in the background (observed
+            // while CouchDB was restarting), so the result is checked in CouchDB itself. A failure
+            // is thrown before applyChange records the content, so the same content is sent again.
+            await this.confirmStored(resolved.databasePath);
             this.receiveLog(` ${path} saved`);
             return true;
         }, { force: !old || !!old.deleted || old.path !== path });
+    }
+    // How often the saved note is looked up before it is reported as missing: a chunk written
+    // in the background may be a moment behind the note. Adjustable for tests.
+    confirmAttempts = 3;
+    confirmIntervalMs = 500;
+    // Confirm that the note and every chunk it refers to are in CouchDB. Reads the database
+    // through the manipulator's own API: the note by ID (rawGet), the chunks by one allDocs per
+    // 500 IDs (liveSyncLocalDB.allDocsRaw), without loading their contents. Chunks embedded in
+    // the note (eden) are counted as present. Throws when something is missing or CouchDB
+    // cannot be asked; resolves when everything is there.
+    private async confirmStored(path: FilePathWithPrefix): Promise<void> {
+        for (let attempt = 1;; attempt++) {
+            const problem = await this.findStoredProblem(path);
+            if (problem === undefined) return;
+            if (attempt >= this.confirmAttempts) {
+                throw new Error(`Saved document could not be confirmed in CouchDB: ${path} (${problem})`);
+            }
+            await delay(this.confirmIntervalMs);
+        }
+    }
+    private async findStoredProblem(path: FilePathWithPrefix): Promise<string | undefined> {
+        const meta = await this.man.rawGet<{
+            children?: string[];
+            eden?: Record<string, unknown>;
+            deleted?: boolean;
+            _deleted?: boolean;
+        }>(await this.man.path2id(path));
+        if (!meta) return "the note is not found";
+        if (meta.deleted || meta._deleted) return "the note is marked as deleted";
+        const embedded = meta.eden ?? {};
+        const chunks = (meta.children ?? []).filter((id) => !(id in embedded));
+        let missing = 0;
+        for (let index = 0; index < chunks.length; index += CHUNK_CHECK_BATCH) {
+            const keys = chunks.slice(index, index + CHUNK_CHECK_BATCH);
+            const result = await this.man.liveSyncLocalDB.allDocsRaw({ keys });
+            missing += result.rows.filter((row) => "error" in row || (row as { value?: { deleted?: boolean } }).value?.deleted).length;
+        }
+        return missing > 0 ? `${missing} of ${chunks.length} chunk(s) not found` : undefined;
     }
     async get(pathSrc: FilePathWithPrefix): Promise<false | FileData> {
         const resolved = await this._prepareOutgoingPath(pathSrc);

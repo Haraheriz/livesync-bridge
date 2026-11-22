@@ -286,6 +286,8 @@ function couch() {
             return Promise.resolve(doc && !doc.deleted ? doc : false);
         },
         getById: (id: string) => Promise.resolve(documents.get(id) ?? false),
+        // Read back by the confirmation of a save (the fake notes have no chunks).
+        rawGet: (id: string) => Promise.resolve(documents.get(id) ?? false),
         getByMeta: (doc: Document) => Promise.resolve(doc),
         put: async (path: string, blob: Blob, info: FileData) => {
             operations.push(`put:${path}`);
