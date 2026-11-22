@@ -326,6 +326,7 @@ below leaves hidden-file synchronisation disabled. To opt in, see
       "useChokidar":false, // Use Chokidar instead of Deno.watchFs; see filesystem watcher limitations.
       "maxConcurrentSends": 10, // Files read and sent at the same time (default 10).
       "rescanIntervalMinutes": 60, // Periodic rescan for missed changes (default 60, randomised to 3/4..5/4; 0 disables).
+      "sendRetryIntervalSeconds": 30, // A failed send is retried after 1, 2, 3, 4 and 5 times this (default 30; 0 turns retries off).
     }
   ]
 }
@@ -359,7 +360,42 @@ A rescan never deletes anything: a file that is missing is not evidence of a del
 With `Deno.watchFs`, deletions and moves of folders are handled by the event
 reconciliation described below, which scans the notified folder immediately; the
 periodic rescan only adds what the events missed. A file is recorded as sent only
-after every peer accepted it, so a failed delivery is picked up by the next rescan.
+after every peer accepted it, so a failed delivery is picked up by the next rescan
+(see "Failed sends" for the retries which come first).
+
+## Failed sends
+
+The hub delivers a change to every other peer of the group before it reports a
+failure to the source, so one peer which is down does not keep the others from
+receiving it. A CouchDB peer confirms a save by reading the note back and looking up
+every chunk it lists; a note or chunk which is missing is a failed delivery (it is
+looked up three times, 0.5 s apart, before it is reported). The source never records
+a change as sent after a failure.
+
+A storage peer then tries the file again 30, 60, 90, 120 and 150 seconds after the
+failure (`sendRetryIntervalSeconds` times 1 to 5), each time reading the file as it
+is then. A failed deletion is retried the same way, after checking again that the
+file is gone. After the fifth retry fails a notice is given and the file is left
+unrecorded for the periodic rescan (deletions are not inferred by a rescan, so a
+deletion which fails every time is not sent until a later event on its folder).
+A file waiting for a retry holds no `maxConcurrentSends` slot, is not queued again by
+a rescan, and is forgotten when the peer stops.
+
+## Folders and files which cannot be read
+
+A folder or file the bridge's user cannot read is left out of the start-up scan, the
+folder reconciliation and the rescans, with one notice per path, and everything else
+is synchronised. Every periodic rescan lists the whole folder again, so a path which
+became readable is found and its files are sent. An unreadable path is never taken
+as deleted: no deletion is sent for files at or below it.
+
+If `Deno.watchFs` cannot be started (or its events fail, for example because the OS
+refuses to watch a folder), the peer reports it and goes on with the periodic rescans
+only: new and changed files are found, but files deleted meanwhile are not noticed.
+Each rescan tries to start the watcher again. In that state the peer reports itself
+as "rescan only (no watcher)", never as restart-worthy. `rescanIntervalMinutes: 0`
+leaves nothing to retry with, so keep it above 0. With `useChokidar: true` only the
+scans skip unreadable paths; Chokidar's own error handling is unchanged.
 
 ## Filesystem watcher limitations
 
