@@ -63,8 +63,13 @@ export class Hub {
         })();
     }
 
+    // Deliver to every other peer of the source's group. A peer which fails does not keep the
+    // later peers from receiving the change: every peer is tried, and the failures are then
+    // reported to the source together, so that it does not record the change as sent.
+    // A single failure is rethrown as it is; several become one AggregateError.
     async dispatch(source: Peer, path: string, data: FileData | false, context?: FileChangeContext) {
         validatePeerPathIdentity(this.conf);
+        const failures: unknown[] = [];
         for (const peer of this.peers) {
             if (peer !== source && (source.config.group ?? "") === (peer.config.group ?? "")) {
                 let ret = false;
@@ -80,7 +85,8 @@ export class Hub {
                 } catch (error) {
                     // Peers record repeats before writing. Do not acknowledge a failed write on retry.
                     peer.cache.clear();
-                    throw error;
+                    failures.push(error);
+                    continue;
                 }
                 if (ret) {
                     // Logger(`  ${data === false ? "-x->" : "--->"} ${peer.config.name} ${path} `)
@@ -88,6 +94,10 @@ export class Hub {
                     // Logger(`        ${peer.config.name} ignored ${path} `)
                 }
             }
+        }
+        if (failures.length === 1) throw failures[0];
+        if (failures.length > 1) {
+            throw new AggregateError(failures, `Delivery of ${path} failed for ${failures.length} peers`);
         }
     }
 }
