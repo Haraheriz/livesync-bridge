@@ -69,7 +69,7 @@ export class PeerCouchDB extends Peer {
     // (Re)create the underlying DirectFileManipulator. Its constructor starts a
     // one-shot async database initialisation. Recovering from a failed attempt
     // requires a fresh manipulator because its `ready` promise remains settled.
-    private _buildManipulator(): void {
+    private async _buildManipulator(): Promise<void> {
         this.config.syncInternalFiles = (this.config.includeInternal?.length ?? 0) > 0;
         // Release the previous instance if we're rebuilding. Each retry that gets
         // past the probe but fails to connect (CouchDB reachable but e.g. a config
@@ -82,7 +82,7 @@ export class PeerCouchDB extends Peer {
             fetch: (request, init) => globalThis.fetch(request, init),
         });
         // Unbound legacy checkpoints are not reused; read this remote from the beginning.
-        this.man.since = this.getSetting("since") ?? "";
+        this.man.since = await this.getSetting("since") ?? "";
         if (prev) void prev.close().catch(() => {});
     }
     private _isCanonicalFilePath(path: string): boolean {
@@ -280,7 +280,7 @@ export class PeerCouchDB extends Peer {
             try {
                 await this._probeCouch();
                 // CouchDB answered cleanly; rebuild against it so init starts fresh.
-                this._buildManipulator();
+                await this._buildManipulator();
                 await this._connectAndWatch();
                 if (attempt > 0) {
                     this.normalLog(`Connected to CouchDB after ${attempt} retr${attempt === 1 ? "y" : "ies"}.`, LOG_LEVEL_NOTICE);
@@ -350,27 +350,27 @@ export class PeerCouchDB extends Peer {
             this.runtimeOptions.validateConfiguration?.();
             if (tweaks && this.config.useRemoteTweaks) {
                 // A fresh manipulator applies the adopted policy to all service settings and database managers.
-                this._buildManipulator();
+                await this._buildManipulator();
                 await this._waitReady(15000);
             }
             // Remote tweak adoption can select another NFC checkpoint namespace.
-            this.man.since = this.getSetting("since") ?? "";
+            this.man.since = await this.getSetting("since") ?? "";
             if (!w) {
                 this.normalLog(`Remote database looks like empty. fetch from the first.`);
                 this.man.since = "";
-                this.setSetting("since", "");
-                this.setSetting("remote-created", "0");
+                await this.setSetting("since", "");
+                await this.setSetting("remote-created", "0");
                 // Connected fine; there's just nothing to watch yet. Mark it so health
                 // counts this as syncing rather than a stuck "not watching" state.
                 this._remoteEmpty = true;
                 return;
             }
             const created = w.created;
-            if (this.getSetting("remote-created") !== `${created}`) {
+            if (await this.getSetting("remote-created") !== `${created}`) {
                 this.man.since = "";
-                this.setSetting("since", "");
+                await this.setSetting("since", "");
                 this.normalLog(`Remote database looks like rebuilt. fetch from the first again.`);
-                this.setSetting("remote-created", `${created}`);
+                await this.setSetting("remote-created", `${created}`);
             } else {
                 this.normalLog(`Watch starting from ${this.man.since}`);
             }
@@ -393,10 +393,12 @@ export class PeerCouchDB extends Peer {
         }
     }
     // Only Commonlib's acknowledged, contiguous position reaches this method.
-    // Persist it before moving the reconnect position so a storage error remains retryable.
-    advanceSince(seq?: string | number): void {
+    // Persist it before moving the reconnect position so a storage error remains
+    // retryable. Commonlib awaits the returned Promise, so a rejected save keeps
+    // the previous position and reaches the watch checkpoint callback.
+    async advanceSince(seq?: string | number): Promise<void> {
         if (seq === undefined || seq === null || `${seq}` === "") return;
-        this.setSetting("since", `${seq}`);
+        await this.setSetting("since", `${seq}`);
         this.man.since = `${seq}`;
     }
     async dispatch(path: string, data: FileData | false) {

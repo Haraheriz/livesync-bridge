@@ -10,6 +10,7 @@ import { minimatch } from "minimatch";
 import { parseFilePath, type PathComparisonSettings } from "@vrtmrz/livesync-commonlib/storage";
 import { DenoStoragePathAccess } from "./DenoStoragePathAccess.ts";
 import { getPeerPathNormalizationVersion } from "./pathIdentity.ts";
+import { errorCode, getPeerState } from "./PeerState.ts";
 
 import { scheduleTask } from "octagonal-wheels/concurrency/task";
 import {
@@ -441,7 +442,14 @@ export class PeerStorage extends Peer {
         }
         if (!this.config.useChokidar) this.knownFiles.add(path);
         const fileStat = `${stat.mtime?.getTime() ?? 0}-${stat.size}`;
-        this.setSetting(key, fileStat);
+        // The record only saves the next offline scan from re-sending this file,
+        // so it is queued and saved in batches; PeerState logs a failure.
+        try {
+            this.setSettingLater(key, fileStat);
+        } catch (ex) {
+            // Only when the state cannot even accept the record. The file is still sent.
+            this.normalLog(`Could not save the file record for ${pathSrc}: ${errorCode(ex)}`, LOG_LEVEL_NOTICE);
+        }
     }
 
     async isChanged(pathSrc: string, access = this.createPathAccess()) {
@@ -450,7 +458,7 @@ export class PeerStorage extends Peer {
     }
     private async isChangedExact(pathSrc: string, path: string, access?: DenoStoragePathAccess) {
         const key = this.fileStatKey(pathSrc, access);
-        const last = this.getSetting(key);
+        const last = await this.getSetting(key);
         // console.log(`R:${key}`);
         // console.log(`RV:${last}`);
 
@@ -583,6 +591,8 @@ export class PeerStorage extends Peer {
                 }
             }
             if (this.watcherDeno !== watcher) return;
+            // Records of the files sent by this scan are saved before the scan is called done.
+            await this.flushFileRecords();
             this.readyDenoWatcher = watcher;
             for await (const event of watcher) {
                 if (!isCurrent()) return;
@@ -684,6 +694,7 @@ export class PeerStorage extends Peer {
                         if (await this.isChangedExact(relativePath, path, access)) await this.dispatch(path, access, isCurrent);
                     }
                 }
+                await this.flushFileRecords();
                 if (this.watcher === watcher) this.readyChokidarWatcher = watcher;
             } catch (error) {
                 if (this.watcher === watcher) this.watcher = undefined;
@@ -691,6 +702,14 @@ export class PeerStorage extends Peer {
                 await this.closeChokidarWatcher(watcher);
                 throw error;
             }
+        }
+    }
+    // Save the queued file records. Never throws: a failure is logged by PeerState.
+    private async flushFileRecords() {
+        try {
+            await getPeerState().flush();
+        } catch (ex) {
+            Logger(ex, LOG_LEVEL_VERBOSE);
         }
     }
     async stop() {
@@ -709,6 +728,7 @@ export class PeerStorage extends Peer {
             }
         }
         await this.closeChokidarWatcher(watcher);
+        await this.flushFileRecords();
     }
     override health(): PeerHealth {
         const chokidarReady = this.watcher && (

@@ -12,6 +12,10 @@ import { PeerCouchDB } from "../../PeerCouchDB.ts";
 import { validatePeerPathIdentity } from "../../pathIdentity.ts";
 import type { FileData, PeerCouchDBConf, PeerStorageConf } from "../../types.ts";
 import { watcherTest } from "./watcherTest.ts";
+import { installTempPeerState } from "../peerStateFixture.ts";
+
+// Peers keep their state in SQLite; use a throw-away file for this run.
+await installTempPeerState();
 
 const server = Deno.env.get("COUCHDB_URL") ?? "http://127.0.0.1:5989";
 const username = Deno.env.get("COUCHDB_USERNAME") ?? "admin";
@@ -208,7 +212,7 @@ for (const encrypted of [false, true]) {
                         );
                         const oldRemote = hub.peers.find((peer): peer is PeerCouchDB => peer instanceof PeerCouchDB)!;
                         await waitFor(
-                            () => !!oldRemote.getSetting("since"),
+                            async () => !!await oldRemote.getSetting("since"),
                             "The delivered feed position must be persisted",
                         );
 

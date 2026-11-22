@@ -2,6 +2,10 @@ import { join, relative } from "@std/path";
 import { PeerStorage } from "../../PeerStorage.ts";
 import type { FileData, PeerStorageConf } from "../../types.ts";
 import { watcherTest } from "./watcherTest.ts";
+import { installTempPeerState } from "../peerStateFixture.ts";
+
+// Peers keep their state in SQLite; use a throw-away file for this run.
+await installTempPeerState();
 
 type Dispatch = {
   path: string;
@@ -382,12 +386,9 @@ async function stopAndWait(harness: Harness): Promise<void> {
   assertNoStartFailures(harness, "watcher stop");
 }
 
-function clearPeerSettings(harness: Harness): void {
-  const prefix = `${harness.peer.config.name}-storage-`;
-  for (let index = localStorage.length - 1; index >= 0; index--) {
-    const key = localStorage.key(index);
-    if (key?.startsWith(prefix)) localStorage.removeItem(key);
-  }
+// Each harness starts from an empty peer state, as the old localStorage cleanup did.
+async function clearPeerSettings(): Promise<void> {
+  await installTempPeerState();
 }
 
 async function withHarness(
@@ -431,7 +432,7 @@ async function withHarness(
     console.log(diagnostics(harness, "watcher trace after stop"));
   }
   try {
-    clearPeerSettings(harness);
+    await clearPeerSettings();
   } catch (error) {
     cleanupFailures.push(error);
   }

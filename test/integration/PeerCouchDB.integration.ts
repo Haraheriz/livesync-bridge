@@ -7,6 +7,10 @@ import { PeerCouchDB } from "../../PeerCouchDB.ts";
 import { PeerStorage } from "../../PeerStorage.ts";
 import { Hub } from "../../Hub.ts";
 import type { FileData, PeerCouchDBConf } from "../../types.ts";
+import { installTempPeerState } from "../peerStateFixture.ts";
+
+// Peers keep their state in SQLite; use a throw-away file for this run.
+await installTempPeerState();
 
 const couchDbUrl = Deno.env.get("COUCHDB_URL") ?? "http://127.0.0.1:5989";
 const couchDbUsername = Deno.env.get("COUCHDB_USERNAME") ?? "admin";
@@ -145,8 +149,8 @@ Deno.test("PeerCouchDB uses a recovery code to read and write an existing ID-v1 
         useRemoteTweaks: true,
     }, async () => {});
     const settings = new Map<string, string>();
-    peer.getSetting = (key) => settings.get(key) ?? null;
-    peer.setSetting = (key, value) => { settings.set(key, value); };
+    peer.getSetting = (key) => Promise.resolve(settings.get(key) ?? null);
+    peer.setSetting = (key, value) => { settings.set(key, value); return Promise.resolve(); };
 
     try {
         await reference.ready.promise;
@@ -285,8 +289,8 @@ Deno.test("PeerCouchDB resumes a stopped peer and delivers offline changes to st
         type: "storage", name: `checkpoint-storage-${suffix}`, baseDir: tempDir, scanOfflineChanges: false,
     }, async () => {});
     const storageSettings = new Map<string, string>();
-    storage.getSetting = (key) => storageSettings.get(key) ?? null;
-    storage.setSetting = (key, value) => { storageSettings.set(key, value); };
+    storage.getSetting = (key) => Promise.resolve(storageSettings.get(key) ?? null);
+    storage.setSetting = (key, value) => { storageSettings.set(key, value); return Promise.resolve(); };
     const waitForFile = async (path: string, content: string) => {
         const deadline = Date.now() + 15_000;
         while (Date.now() < deadline) {
@@ -312,24 +316,22 @@ Deno.test("PeerCouchDB resumes a stopped peer and delivers offline changes to st
         await first.start();
         assert(await writer.put("before.md", new Blob(["before"], { type: "text/plain" }), info, "plain"), "The first note should be written");
         await waitForFile("before.md", "before");
-        const saved = first.getSetting("since");
+        const saved = await first.getSetting("since");
         assert(saved !== null && saved !== "" && saved !== "now", "The running peer should save a concrete feed position");
         await first.stop();
         await first.man.close();
         delivered.length = 0;
 
         assert(await writer.put("offline.md", new Blob(["missed"], { type: "text/plain" }), info, "plain"), "A note should be written while the peer is stopped");
-        assertEquals(restarted.getSetting("since"), saved, "The new peer instance should read the persisted position");
+        assertEquals(await restarted.getSetting("since"), saved, "The new peer instance should read the persisted position");
         hub.peers = [restarted, storage];
         await restarted.start();
         await waitForFile("offline.md", "missed");
         assertEquals(delivered.includes("before.md"), false, "The resumed feed should not replay the note before its saved position");
-        assert(restarted.getSetting("since") !== saved, "The offline change should advance the saved position");
+        assert(await restarted.getSetting("since") !== saved, "The offline change should advance the saved position");
     } finally {
         await Promise.allSettled([first.stop(), restarted.stop()]);
         await Promise.allSettled([writer.close(), first.man?.close(), restarted.man?.close()]);
-        localStorage.removeItem(first._getKey("since"));
-        localStorage.removeItem(first._getKey("remote-created"));
         await (await requestDatabase(database, "DELETE")).text();
         await Deno.remove(tempDir, { recursive: true });
     }
@@ -401,9 +403,10 @@ for (const baseDir of ["", "blog/"]) {
                 }, dispatch);
                 for (const instance of [peer, storage]) {
                     const settings = new Map<string, string>();
-                    instance.getSetting = (key) => settings.get(key) ?? null;
+                    instance.getSetting = (key) => Promise.resolve(settings.get(key) ?? null);
                     instance.setSetting = (key, value) => {
                         settings.set(key, value);
+                        return Promise.resolve();
                     };
                 }
                 hub.peers = [peer, storage];
@@ -1017,8 +1020,8 @@ Deno.test("CouchDB retries delayed chunks across three peers without checkpointi
     const source = new PeerCouchDB({
         ...makeConfig(`delayed-${suffix}`, database), passphrase: "", obfuscatePassphrase: "",
     }, hub.dispatch.bind(hub));
-    source.setSetting = (key, value) => { settings.set(key, value); };
-    source.getSetting = (key) => settings.get(key) ?? null;
+    source.setSetting = (key, value) => { settings.set(key, value); return Promise.resolve(); };
+    source.getSetting = (key) => Promise.resolve(settings.get(key) ?? null);
     const targets = roots.map((baseDir, index) => new PeerStorage({
         type: "storage", name: `delayed-target-${index}`, baseDir,
     }, async () => {}));
@@ -1065,11 +1068,11 @@ Deno.test("CouchDB retries delayed chunks across three peers without checkpointi
         await waitFor(() => contents("later.md", "next"), "The unrelated file must reach both destinations");
         assert(laterSequence !== undefined, "The later metadata row must be observed in the feed");
         // Compare the exact feed token; database-info tokens can encode the same position differently.
-        assert(source.getSetting("since") !== laterSequence, "The later file must not checkpoint past the missing chunk");
+        assert(await source.getSetting("since") !== laterSequence, "The later file must not checkpoint past the missing chunk");
         assert(!await contents("late.md", "late"), "The missing body must not be fabricated");
         await put({ _id: "h:delayed", type: "leaf", data: "late" });
         await waitFor(() => contents("late.md", "late"), "The late chunk must be retried without editing its metadata");
-        await waitFor(() => source.getSetting("since") === laterSequence, "Completion must release the checkpoint gap");
+        await waitFor(async () => await source.getSetting("since") === laterSequence, "Completion must release the checkpoint gap");
         const metadataResponse = await fetch(`${couchDbUrl}/${database}/late.md`, { headers: { authorization: authHeader } });
         const saved = await metadataResponse.json();
         assert(saved._rev.startsWith("1-"), "Recovery must not require a metadata edit");

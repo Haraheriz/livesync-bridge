@@ -76,8 +76,10 @@ function makeDestination(baseDir: string) {
     const settings = new Map<string, string>();
     peer.setSetting = (key, value) => {
         settings.set(key, value);
+        return Promise.resolve();
     };
-    peer.getSetting = (key) => settings.get(key) ?? null;
+    peer.getSetting = (key) => Promise.resolve(settings.get(key) ?? null);
+    peer.setSettingLater = (key, value) => void peer.setSetting(key, value);
     return peer;
 }
 
@@ -180,28 +182,30 @@ function makeSinceSource() {
     const settings = new Map<string, string>();
     peer.setSetting = (key, value) => {
         settings.set(key, value);
+        return Promise.resolve();
     };
-    peer.getSetting = (key) => settings.get(key) ?? null;
+    peer.getSetting = (key) => Promise.resolve(settings.get(key) ?? null);
+    peer.setSettingLater = (key, value) => void peer.setSetting(key, value);
     // The manipulator is only built in start(); a stand-in is enough for this unit.
     (peer as unknown as { man: { since: string } }).man = { since: "now" };
     return peer;
 }
 
-Deno.test("advanceSince persists the real changes-feed position instead of 'now'", () => {
+Deno.test("advanceSince persists the real changes-feed position instead of 'now'", async () => {
     const peer = makeSinceSource();
-    peer.advanceSince("42-g1AAAABxeJzLYWBgYMpgTmHgz8tPSTV0MDQ");
+    await peer.advanceSince("42-g1AAAABxeJzLYWBgYMpgTmHgz8tPSTV0MDQ");
     assertEquals(peer.man.since, "42-g1AAAABxeJzLYWBgYMpgTmHgz8tPSTV0MDQ", "man.since follows the feed");
-    assertEquals(peer.getSetting("since"), "42-g1AAAABxeJzLYWBgYMpgTmHgz8tPSTV0MDQ", "since is persisted");
-    peer.advanceSince(43);
-    assertEquals(peer.getSetting("since"), "43", "numeric seqs are stored as strings");
+    assertEquals(await peer.getSetting("since"), "42-g1AAAABxeJzLYWBgYMpgTmHgz8tPSTV0MDQ", "since is persisted");
+    await peer.advanceSince(43);
+    assertEquals(await peer.getSetting("since"), "43", "numeric seqs are stored as strings");
 });
 
-Deno.test("advanceSince ignores a missing seq", () => {
+Deno.test("advanceSince ignores a missing seq", async () => {
     const peer = makeSinceSource();
-    peer.setSetting("since", "7");
-    peer.advanceSince(undefined);
-    peer.advanceSince("");
-    assertEquals(peer.getSetting("since"), "7", "stored position is kept");
+    await peer.setSetting("since", "7");
+    await peer.advanceSince(undefined);
+    await peer.advanceSince("");
+    assertEquals(await peer.getSetting("since"), "7", "stored position is kept");
     assertEquals(peer.man.since, "now", "man.since is kept");
 });
 
@@ -233,11 +237,11 @@ for (const deleted of [false, true]) {
     });
 }
 
-Deno.test("advanceSince retains the reconnect position when saving fails", () => {
+Deno.test("advanceSince retains the reconnect position when saving fails", async () => {
     const peer = makeSinceSource();
-    peer.setSetting = () => { throw new Error("Controlled storage failure"); };
+    peer.setSetting = () => Promise.reject(new Error("Controlled storage failure"));
     let rejected = false;
-    try { peer.advanceSince("41-token"); } catch { rejected = true; }
+    try { await peer.advanceSince("41-token"); } catch { rejected = true; }
     assert(rejected, "Persistence failure must reach the watch checkpoint callback");
     assertEquals(peer.man.since, "now", "A failed checkpoint write must retain the previous reconnect position");
 });

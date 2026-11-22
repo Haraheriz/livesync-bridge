@@ -6,6 +6,7 @@ import { LRUCache } from "octagonal-wheels/memory/LRUCache";
 import { computeHash } from "./util.ts";
 import { getStoragePathComparisonKey, parseFilePath, type PathComparisonSettings } from "@vrtmrz/livesync-commonlib/storage";
 import { getPeerPathNormalizationVersion } from "./pathIdentity.ts";
+import { getPeerState } from "./PeerState.ts";
 
 export type DispatchFun = (source: Peer, path: string, data: FileData | false) => Promise<void>;
 
@@ -126,11 +127,17 @@ export abstract class Peer {
     _getKey(key: string) {
         return `${this.config.name}-${this.config.type}-${this.config.baseDir}-${key}`;
     }
-    setSetting(key: string, value: string) {
-        return localStorage.setItem(this._getKey(key), value);
+    // Peer state lives in SQLite (see PeerState.ts). Saving can fail, so callers
+    // must await it and decide what a failure means for them.
+    setSetting(key: string, value: string): Promise<void> {
+        return getPeerState().setValue(this._getKey(key), value);
     }
-    getSetting(key: string) {
-        return localStorage.getItem(this._getKey(key));
+    // Queued, not awaited: for records whose loss only causes a resend.
+    setSettingLater(key: string, value: string): void {
+        getPeerState().setValueLater(this._getKey(key), value);
+    }
+    getSetting(key: string): Promise<string | null> {
+        return getPeerState().getValue(this._getKey(key));
     }
     compareDate(a: { mtime?: number }, b: { mtime?: number }) {
         const aMTime = ~~(a?.mtime ?? 0 / 1000);

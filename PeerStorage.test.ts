@@ -4,6 +4,10 @@ import { LOG_LEVEL_NOTICE } from "octagonal-wheels/common/logger";
 import { serialized } from "octagonal-wheels/concurrency/lock";
 import { PeerStorage } from "./PeerStorage.ts";
 import type { FileData, PeerStorageConf } from "./types.ts";
+import { installTempPeerState } from "./test/peerStateFixture.ts";
+
+// Tests that use the real Peer.getSetting/setSetting need an open state file.
+await installTempPeerState();
 
 function assertEquals<T>(actual: T, expected: T, message: string) {
     if (actual !== expected) {
@@ -42,6 +46,15 @@ function makeRecordingPeer(baseDir: string, extra: Partial<PeerStorageConf> = {}
         dispatched.push({ path, data });
         return Promise.resolve();
     });
+    // Keep file records in memory: the real queue defers saving by a timer, which
+    // Deno 2.6 reports as a leaked timer when it outlives the test.
+    const settings = new Map<string, string>();
+    peer.setSetting = (key, value) => {
+        settings.set(key, value);
+        return Promise.resolve();
+    };
+    peer.getSetting = (key) => Promise.resolve(settings.get(key) ?? null);
+    peer.setSettingLater = (key, value) => void peer.setSetting(key, value);
     return { peer, dispatched };
 }
 
@@ -297,8 +310,10 @@ function makeWritePeer(baseDir: string) {
     const settings = new Map<string, string>();
     peer.setSetting = (key, value) => {
         settings.set(key, value);
+        return Promise.resolve();
     };
-    peer.getSetting = (key) => settings.get(key) ?? null;
+    peer.getSetting = (key) => Promise.resolve(settings.get(key) ?? null);
+    peer.setSettingLater = (key, value) => void peer.setSetting(key, value);
     const notices: string[] = [];
     peer.normalLog = (message, level) => {
         if (level === LOG_LEVEL_NOTICE) notices.push(message);
@@ -786,7 +801,7 @@ async function withDenoRemovalFixture(
                 } else {
                     // Seed offline scan state directly: writeFileStat would also seed the new inventory.
                     const stat = await Deno.stat(file);
-                    peer.setSetting(`file-stat-${peer.toLocalPath(vaultPath)}`, `${stat.mtime?.getTime() ?? 0}-${stat.size}`);
+                    await peer.setSetting(`file-stat-${peer.toLocalPath(vaultPath)}`, `${stat.mtime?.getTime() ?? 0}-${stat.size}`);
                 }
             }
         }

@@ -41,12 +41,13 @@ function harness(
     });
     peer.normalLog = () => {};
     const settings = new Map<string, string>();
-    peer.getSetting = (key) => settings.get(peer._getKey(key)) ?? null;
+    peer.getSetting = (key) => Promise.resolve(settings.get(peer._getKey(key)) ?? null);
     peer.setSetting = (key, value) => {
         settings.set(peer._getKey(key), value);
+        return Promise.resolve();
     };
-    (peer as unknown as { _buildManipulator(): void })._buildManipulator = () => {
-        peer.man = { ...peer.man, since: peer.getSetting("since") ?? "" } as DirectFileManipulator;
+    (peer as unknown as { _buildManipulator(): Promise<void> })._buildManipulator = async () => {
+        peer.man = { ...peer.man, since: await peer.getSetting("since") ?? "" } as DirectFileManipulator;
     };
     const milestone = { created: 7, tweak_values: options.tweaks ?? { PREFERRED: {} } };
     let watchCount = 0;
@@ -164,12 +165,12 @@ for (const savedSequence of [undefined, "12-sensitive"]) {
                 peer: { pathNormalizationVersion: 1, useRemoteTweaks: true },
                 tweaks: { PREFERRED: { handleFilenameCaseSensitive: true } },
             });
-            h.peer.setSetting("since", "99-insensitive");
-            h.peer.setSetting("remote-created", "7");
+            await h.peer.setSetting("since", "99-insensitive");
+            await h.peer.setSetting("remote-created", "7");
             h.peer.man.since = "99-insensitive";
             h.config.handleFilenameCaseSensitive = true;
-            h.peer.setSetting("remote-created", "7");
-            if (savedSequence) h.peer.setSetting("since", savedSequence);
+            await h.peer.setSetting("remote-created", "7");
+            if (savedSequence) await h.peer.setSetting("since", savedSequence);
             h.config.handleFilenameCaseSensitive = false;
             await h.connect();
             assert(
@@ -177,7 +178,7 @@ for (const savedSequence of [undefined, "12-sensitive"]) {
                 "The watch must use only the effective policy's sequence",
             );
             h.config.handleFilenameCaseSensitive = false;
-            assert(h.peer.getSetting("since") === "99-insensitive", "Another policy's saved state must remain intact");
+            assert(await h.peer.getSetting("since") === "99-insensitive", "Another policy's saved state must remain intact");
         },
     );
 }

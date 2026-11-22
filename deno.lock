@@ -10,6 +10,7 @@
     "npm:@types/pouchdb@*": "6.4.2",
     "npm:@types/pouchdb@^6.4.2": "6.4.2",
     "npm:@vrtmrz/livesync-commonlib@0.3.1": "0.3.1",
+    "npm:@vrtmrz/value-store@0.1.1": "0.1.1",
     "npm:chokidar@^3.5.1": "3.6.0",
     "npm:minimatch@^10.2.5": "10.2.6",
     "npm:octagonal-wheels@~0.1.53": "0.1.56"
@@ -500,7 +501,7 @@
         "@smithy/types",
         "@smithy/util-retry",
         "@trystero-p2p/nostr",
-        "@vrtmrz/value-store",
+        "@vrtmrz/value-store@0.1.0",
         "diff-match-patch",
         "events",
         "fflate",
@@ -528,6 +529,9 @@
     },
     "@vrtmrz/value-store@0.1.0": {
       "integrity": "sha512-M62f1j0bnJkqpgI5sYxnkXUAOSDEwQbYrLf+w58gCCm4sjIXDmFzDJd2duXabRbktBlACt9P99yjN/9gOAPxrA=="
+    },
+    "@vrtmrz/value-store@0.1.1": {
+      "integrity": "sha512-DLtj/1W43fq7dMfdonJ86Ug1qrwNxhYcSSvxv7R4JbEDlgsOgsgcgV8T3jotVgxqdlQaTTjKcm82AoDW0XBNnQ=="
     },
     "abstract-leveldown@2.7.2": {
       "integrity": "sha512-+OVvxH2rHVEhWLdbudP6p0+dNMXu8JA1CbhP19T8paTYAcX7oJ4OVjT+ZUVpv7mITxXHqDMej+GdqXBmXkw09w==",
@@ -1165,6 +1169,7 @@
       "npm:@types/diff-match-patch@^1.0.36",
       "npm:@types/pouchdb@^6.4.2",
       "npm:@vrtmrz/livesync-commonlib@0.3.1",
+      "npm:@vrtmrz/value-store@0.1.1",
       "npm:chokidar@^3.5.1",
       "npm:minimatch@^10.2.5",
       "npm:octagonal-wheels@~0.1.53"

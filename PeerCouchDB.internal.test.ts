@@ -29,9 +29,10 @@ function makePeer(
     ...overrides,
   }, async () => {});
   const settings = new Map<string, string>();
-  peer.getSetting = (key) => settings.get(key) ?? null;
+  peer.getSetting = (key) => Promise.resolve(settings.get(key) ?? null);
   peer.setSetting = (key, value) => {
     settings.set(key, value);
+      return Promise.resolve();
   };
   peer.normalLog = () => {};
   return peer;

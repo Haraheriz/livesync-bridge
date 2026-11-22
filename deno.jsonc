@@ -19,6 +19,8 @@
         "@vrtmrz/livesync-commonlib/compat/common/utils": "npm:@vrtmrz/livesync-commonlib@0.3.1/compat/common/utils",
         "@vrtmrz/livesync-commonlib/compat/string_and_binary/convert": "npm:@vrtmrz/livesync-commonlib@0.3.1/compat/string_and_binary/convert",
         "@vrtmrz/livesync-commonlib/compat/string_and_binary/path": "npm:@vrtmrz/livesync-commonlib@0.3.1/compat/string_and_binary/path",
+        "@vrtmrz/value-store": "npm:@vrtmrz/value-store@0.1.1",
+        "@vrtmrz/value-store/node-sqlite": "npm:@vrtmrz/value-store@0.1.1/node-sqlite",
         "@std/cli": "jsr:@std/cli@^1.0.17",
         "@std/path": "jsr:@std/path@^1.0.9",
         "@types/pouchdb": "npm:@types/pouchdb@^6.4.2",

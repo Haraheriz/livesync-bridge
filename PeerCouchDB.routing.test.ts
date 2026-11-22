@@ -73,8 +73,8 @@ function fixture(
     delivered.push({ path, data: value });
     return Promise.resolve();
   });
-  peer.getSetting = () => null;
-  peer.setSetting = () => {};
+  peer.getSetting = () => Promise.resolve(null);
+  peer.setSetting = async () => {};
   peer.normalLog = (message) => notices.push(message);
   peer.receiveLog = () => {};
   peer.sendLog = () => {};

@@ -14,6 +14,10 @@ import { getDocData } from "@vrtmrz/livesync-commonlib/compat/common/utils";
 import { decodeBinary } from "@vrtmrz/livesync-commonlib/compat/string_and_binary/convert";
 import { isLockAcquired } from "octagonal-wheels/concurrency/lock";
 import { watcherTest } from "./watcherTest.ts";
+import { installTempPeerState } from "../peerStateFixture.ts";
+
+// Peers keep their state in SQLite; use a throw-away file for this run.
+await installTempPeerState();
 
 const couchDbUrl = Deno.env.get("COUCHDB_URL") ?? "http://127.0.0.1:5989";
 const authorization = `Basic ${btoa(`${Deno.env.get("COUCHDB_USERNAME") ?? "admin"}:${Deno.env.get("COUCHDB_PASSWORD") ?? "testpassword"}`)}`;
@@ -191,11 +195,6 @@ for (const parentOnly of [false, true]) {
                 ...hub.peers.filter((peer): peer is PeerCouchDB => peer instanceof PeerCouchDB).map((peer) => peer.man?.close()),
                 reader.man?.close(),
             ]);
-            const names = [storageConfig.name, remoteConfig.name, readerConfig.name];
-            for (let index = localStorage.length - 1; index >= 0; index--) {
-                const key = localStorage.key(index);
-                if (key && names.some((name) => key.startsWith(`${name}-`))) localStorage.removeItem(key);
-            }
             if (databaseCreated) {
                 const deleted = await request(database, "", { method: "DELETE" });
                 await deleted.body?.cancel();
@@ -548,9 +547,10 @@ for (const baseDir of ["", "blog/"]) {
                     assert(remote && storage, "The Hub should construct real CouchDB and storage peers");
                     for (const peer of hub.peers) {
                         const settings = new Map<string, string>();
-                        peer.getSetting = (key) => settings.get(key) ?? null;
+                        peer.getSetting = (key) => Promise.resolve(settings.get(key) ?? null);
                         peer.setSetting = (key, value) => {
                             settings.set(key, value);
+                            return Promise.resolve();
                         };
                     }
 

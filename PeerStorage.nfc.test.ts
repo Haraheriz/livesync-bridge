@@ -171,8 +171,10 @@ Deno.test("NFC file statistics survive restart without reusing Legacy observatio
         const { peer } = makePeer(root, { name: "observations", pathNormalizationVersion: version });
         peer.setSetting = (key, value) => {
             settings.set(peer._getKey(key), value);
+            return Promise.resolve();
         };
-        peer.getSetting = (key) => settings.get(peer._getKey(key)) ?? null;
+        peer.getSetting = (key) => Promise.resolve(settings.get(peer._getKey(key)) ?? null);
+        peer.setSettingLater = (key, value) => void peer.setSetting(key, value);
         peers.push(peer);
         return peer;
     };
