@@ -28,6 +28,13 @@ feed for both direct remote mismatch and mismatch introduced by explicit tweak
 adoption. The top-level mismatch override then permits a real round trip while
 retaining each peer's case setting and the original Metadata revision ancestry.
 
+`LateChunksEncrypted.integration.ts` also runs in `test:integration`. It copies a
+note document into a second database before its chunks and checks, with end-to-end
+encryption and path obfuscation (also with encrypted metadata), that nothing is
+delivered until the chunks arrive, that the delivered text is then the exact plaintext
+and never ciphertext, and that an unrelated note and a reader restart do not change
+that.
+
 Root unit tests cover default Legacy settings, invalid versions, group
 agreement, cache and checkpoint identity, aliases after earlier cache hits,
 permission failures, stopped notifications, and incomplete initial inventories.
