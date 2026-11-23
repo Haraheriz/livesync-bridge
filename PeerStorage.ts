@@ -37,6 +37,15 @@ export const DEFAULT_SEND_RETRY_INTERVAL_SECONDS = 30;
 export const MAX_SEND_RETRIES = 5;
 const MAX_GIVE_UP_NOTICES = 20;
 
+// Byte-for-byte equality of two buffers.
+function isSameBytes(a: Uint8Array, b: Uint8Array): boolean {
+    if (a.byteLength !== b.byteLength) return false;
+    for (let i = 0; i < a.byteLength; i++) {
+        if (a[i] !== b[i]) return false;
+    }
+    return true;
+}
+
 // A short reason for a failure, for notices: the OS error code when there is one.
 function failureReason(ex: unknown): string {
     if (!(ex instanceof Error)) return "not readable";
@@ -381,6 +390,36 @@ export class PeerStorage extends Peer {
             // Keyed by the vault path, like dispatch(), so the resulting watcher event is a repeat.
             // The content is remembered only after it was written, so a failed write can be retried.
             return await this.applyChange(pathSrc, data, async () => {
+                // Do not rewrite a file whose content is already the same. A catch-up from an
+                // older changes-feed position re-delivers every document; the repeat cache holds
+                // only a few hundred paths, and a rewrite of identical data would still cost a
+                // full copy in the next snapshot of a snapshotting filesystem (Btrfs) and make
+                // the watcher or the rescan send every file back. The sizes are compared first
+                // so that only a file of the same size is read. This runs inside applyChange, so
+                // the check and a write for the same path never interleave, and the content
+                // is remembered as a repeat as after a write. It returns true: the content is in
+                // place, which rename() needs in order to remove the previous path.
+                let existingStat: Deno.FileInfo | undefined;
+                try {
+                    existingStat = await Deno.stat(path);
+                } catch (_e) {
+                    existingStat = undefined;
+                }
+                if (existingStat?.isFile && existingStat.size === incoming.byteLength) {
+                    let existing: Uint8Array | undefined;
+                    try {
+                        existing = await Deno.readFile(path);
+                    } catch (_e) {
+                        existing = undefined;
+                    }
+                    if (existing && isSameBytes(existing, incoming)) {
+                        this.debugLog(`${lp} unchanged; not rewritten`);
+                        // Record what is on disk (its own mtime and size), so that neither the
+                        // offline scan nor a rescan finds the file changed.
+                        await this.writeFileStat(pathSrc, existingStat, access);
+                        return true;
+                    }
+                }
                 // While recursive is true, mkdir will not raise the `AlreadyExist`.
                 await Deno.mkdir(dirname(path), { recursive: true });
                 const fp = await Deno.open(path, { read: true, write: true, create: true });

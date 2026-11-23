@@ -189,6 +189,12 @@ position could skip them. The changes feed is therefore read from the beginning
 on the first start. A file that cannot be read is reported and ignored, and the
 import is tried again at the next start. `--reset` prevents the import for good.
 
+Reading the changes feed from the beginning delivers every document again. A storage peer
+does not rewrite a file whose content on disk is already identical to the document
+(sizes are compared first, and only a file of the same size is read): its modification
+time is kept, the processor script is not run, and its record is made to match the file,
+so the watcher and the rescans do not send it back.
+
 If a file record cannot be saved, the file is still sent and the failure code is
 logged; the next offline scan sends it again. If a CouchDB resume position
 cannot be saved, the position is not advanced and the change is read again after
