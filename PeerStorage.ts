@@ -28,6 +28,9 @@ const IGNORE_MATCH_OPTIONS = { dot: true } as const;
 // How many files are read and sent at the same time. LiveSync itself limits its own bulk
 // processing to 10 (ReplicateResultProcessor, HiddenFileSync: Semaphore(10)).
 export const DEFAULT_MAX_CONCURRENT_SENDS = 10;
+// Folders a Synology NAS creates inside a shared folder by itself: thumbnails, the recycle bin
+// and the snapshot view. Synced, they would be written into every device's vault.
+export const DEFAULT_EXCLUDE_NAMES = ["@eaDir", "#recycle", "#snapshot"];
 const SEND_PROGRESS_INTERVAL_MS = 60_000;
 // Delay before rescanning a folder Chokidar reported as added (see onAddDir).
 export const NEW_DIR_RESCAN_DELAY_MS = 2_000;
@@ -193,6 +196,19 @@ export class PeerStorage extends Peer {
 
     constructor(conf: PeerStorageConf, dispatcher: DispatchFun) {
         super(conf, dispatcher);
+        // A string would be searched for substrings, and a name with "/" could never match a
+        // path segment: refuse both instead of excluding too much or nothing at all.
+        const names: unknown = conf.excludeNames;
+        if (names !== undefined && (!Array.isArray(names) || names.some((name) => typeof name !== "string"))) {
+            throw new Error(`excludeNames of peer "${conf.name}" must be an array of file or folder names`);
+        }
+        if (conf.excludeNames?.some((name) => name.includes("/"))) {
+            throw new Error(`excludeNames of peer "${conf.name}" holds single names; they cannot contain "/"`);
+        }
+        const dot: unknown = conf.excludeDotNames;
+        if (dot !== undefined && typeof dot !== "boolean") {
+            throw new Error(`excludeDotNames of peer "${conf.name}" must be true or false`);
+        }
     }
 
     private createPathAccess(): DenoStoragePathAccess | undefined {
@@ -278,12 +294,57 @@ export class PeerStorage extends Peer {
         return false;
     }
 
+    // ---- Names left out of syncing, in both directions ----
+    // A peer-relative POSIX path is excluded when any of its segments is one of `excludeNames`
+    // (default: the Synology folders) or, while `excludeDotNames` is on (default), starts with
+    // a ".". Unlike `ignore`, which only stops this peer from sending, an excluded path is also
+    // never written or deleted here on behalf of another peer. Segments are compared exactly;
+    // with pathNormalizationVersion 1 they are compared as NFC, and without case sensitivity
+    // (handleFilenameCaseSensitive) also case-folded, like the peer's other path comparisons.
+    // Read from the configuration at each call, so nothing has to be invalidated.
+    isExcludedPath(path: string): boolean {
+        if (!path) return false;
+        const names = this.config.excludeNames ?? DEFAULT_EXCLUDE_NAMES;
+        const dot = this.config.excludeDotNames ?? true;
+        if (!dot && names.length === 0) return false;
+        const identity = getPeerPathNormalizationVersion(this.config) === 1;
+        const key = identity
+            ? (name: string) => {
+                const normalized = name.normalize("NFC");
+                return this.config.handleFilenameCaseSensitive ? normalized : normalized.toLowerCase();
+            }
+            : (name: string) => name;
+        const excluded = names.map(key);
+        for (const segment of path.split("/")) {
+            if (segment === "" || segment === "." || segment === "..") continue;
+            if (dot && segment.startsWith(".")) return true;
+            if (excluded.includes(key(segment))) return true;
+        }
+        return false;
+    }
+
+    // The same for an absolute path as the watchers report it.
+    private isExcludedLocal(path: string): boolean {
+        return this.isExcludedPath(this.toRelativePath(path));
+    }
+
     // Peer-relative POSIX path of an absolute path as the watchers report it.
     toRelativePath(pathSrc: string) {
         return this.toPosixPath(relative(this.toStoragePath(this.toLocalPath(".")), pathSrc));
     }
 
+    // An incoming change under an excluded name is not an error and not a failed delivery: it is
+    // answered with `false` ("nothing was applied", as for a skipped or unchanged write) and is
+    // never thrown, so the hub reports no failure and the source has nothing to retry.
+    // Nothing on disk is read, written or deleted for it.
+    private refuseExcluded(operation: string, path: string): boolean {
+        if (!this.isExcludedPath(path)) return false;
+        this.debugLog(`${operation} skipped: ${path} (excluded name)`);
+        return true;
+    }
+
     async delete(pathSrc: string): Promise<boolean> {
+        if (this.refuseExcluded("Delete", pathSrc)) return false;
         const access = this.createPathAccess();
         return await this.storageOperation(pathSrc, access, () => this.deleteFile(pathSrc, access));
     }
@@ -323,10 +384,16 @@ export class PeerStorage extends Peer {
     // A file moved at the source: write the new path first, then remove the old one.
     // The old path is kept when both resolve to the same file (a case-only rename on a
     // case-insensitive filesystem, or the same file under another normalisation).
+    // Under an excluded name nothing is written, moved or removed: a move onto an excluded name
+    // is refused by put() and leaves the old file as it is (it is not removed, as the new one was
+    // not stored), and a move from an excluded name stores the new file but leaves the excluded
+    // source alone, without even looking at it.
     override async rename(previousPath: string, path: string, data: FileData): Promise<boolean> {
+        const previousExcluded = this.refuseExcluded("Rename of the previous path", previousPath);
         if (this.isUnsafeVaultPath(previousPath) || this.isUnsafeVaultPath(path)) return false;
         const saved = await this.put(path, data);
         if (!saved) return false;
+        if (previousExcluded) return saved;
         const access = this.createPathAccess();
         try {
             const previous = await Deno.realPath(await this.resolveStoragePath(previousPath, access));
@@ -341,6 +408,7 @@ export class PeerStorage extends Peer {
     // A deletion reported by `source` is skipped while the source still has a file
     // that is this path (or the same file under another spelling).
     override async deleteFrom(path: string, source: Peer): Promise<boolean> {
+        if (this.refuseExcluded("Delete", path)) return false;
         const current = await source.currentPaths(path);
         if (current.includes(path)) return false;
         const access = this.createPathAccess();
@@ -356,6 +424,7 @@ export class PeerStorage extends Peer {
         return await this.delete(path);
     }
     async put(pathSrc: string, data: FileData): Promise<boolean> {
+        if (this.refuseExcluded("Write", pathSrc)) return false;
         const access = this.createPathAccess();
         return await this.storageOperation(pathSrc, access, () => this.putFile(pathSrc, data, access));
     }
@@ -651,6 +720,10 @@ export class PeerStorage extends Peer {
             this.debugLog(`${path} ignored`);
             return Promise.resolve();
         }
+        if (this.isExcludedPath(path)) {
+            this.debugLog(`${path} excluded`);
+            return Promise.resolve();
+        }
 
         return this.queueTask(pathSrc, pathSrc, async () => {
             await delay(250);
@@ -725,6 +798,10 @@ export class PeerStorage extends Peer {
         if (this.isOutsideBaseDir(path)) return Promise.resolve();
         if (this.isIgnored(path)) {
             this.debugLog(`${path} ignored`);
+            return Promise.resolve();
+        }
+        if (this.isExcludedPath(path)) {
+            this.debugLog(`${path} excluded`);
             return Promise.resolve();
         }
         return this.queueTask(pathSrc, pathSrc, async () => {
@@ -968,6 +1045,10 @@ export class PeerStorage extends Peer {
                 this.debugLog(`${relativePath} ignored`);
                 return false;
             }
+            // Deno.watchFs cannot be told to skip a tree, so its events are dropped here, before
+            // anything is stat()ed. A move between an excluded and a normal name keeps only the
+            // normal side: it is a deletion or a new file as far as the other peers are concerned.
+            if (this.isExcludedPath(relativePath)) return false;
             return true;
         });
         if (!paths.length) return;
@@ -1067,7 +1148,7 @@ export class PeerStorage extends Peer {
         }
         for (const current of currentEntries) {
             const relativePath = this.toRelativePath(current);
-            if (this.isIgnored(relativePath)) continue;
+            if (this.isIgnored(relativePath) || this.isExcludedPath(relativePath)) continue;
             let stat: Deno.FileInfo;
             try {
                 stat = await Deno.lstat(current);
@@ -1100,7 +1181,7 @@ export class PeerStorage extends Peer {
         await Promise.all(removed.map((file) => this.queueDeletion(file, isCurrent)));
     }
 
-    // Prune ignored trees before inventorying or inspecting their contents, even
+    // Prune ignored and excluded trees before inventorying or inspecting their contents, even
     // when offline uploads are disabled and only the deletion inventory is needed.
     private async *listFiles(directory: string, prefix = "", access = this.createPathAccess()): AsyncGenerator<string> {
         if (access) {
@@ -1108,7 +1189,8 @@ export class PeerStorage extends Peer {
                 onUnreadable: (path: StoragePath, error: unknown) => this.noteUnreadable(access.absolute(path), true, error),
                 onReadable: (path: StoragePath) => this.clearUnreadable(access.absolute(path), true),
             };
-            for await (const path of access.files((path) => this.isIgnored(path), prefix as StoragePath, unreadable)) {
+            const skipped = (path: string) => this.isIgnored(path) || this.isExcludedPath(path);
+            for await (const path of access.files(skipped, prefix as StoragePath, unreadable)) {
                 yield access.absolute(path);
             }
             return;
@@ -1118,6 +1200,11 @@ export class PeerStorage extends Peer {
                 const relativePath = prefix ? `${prefix}/${entry.name}` : entry.name;
                 if (this.isIgnored(relativePath)) {
                     this.debugLog(`${relativePath} ignored`);
+                    continue;
+                }
+                // Not descended into: an excluded folder (@eaDir) can hold thousands of files.
+                if (this.isExcludedPath(relativePath)) {
+                    this.debugLog(`${relativePath} excluded`);
                     continue;
                 }
                 const path = resolve(directory, entry.name);
@@ -1245,6 +1332,8 @@ export class PeerStorage extends Peer {
 
     // Returns the number of files queued for sending.
     async rescan(dir: string, reason: string): Promise<number> {
+        // Inside an excluded folder there is nothing to look for.
+        if (this.isExcludedLocal(dir)) return 0;
         const generation = this.generation;
         const isCurrent = () => !this.stopped && this.generation === generation;
         const access = this.createPathAccess();
@@ -1309,6 +1398,7 @@ export class PeerStorage extends Peer {
         if (!this.watcherReady || this.stopped) return;
         const relativePath = this.toRelativePath(path);
         if (!relativePath || this.isOutsideBaseDir(relativePath) || this.isIgnored(relativePath)) return;
+        if (this.isExcludedPath(relativePath)) return;
         const previous = this.newDirTimers.get(path);
         if (previous !== undefined) clearTimeout(previous);
         this.newDirTimers.set(
@@ -1570,10 +1660,13 @@ export class PeerStorage extends Peer {
         const watcher = chokidar.watch(lP,
             {
                 ignoreInitial: access ? true : !this.config.scanOfflineChanges,
-                // Prunes ignored directories from the watch itself, so their contents
-                // are never stat()ed or watched. dispatch() filters as well, for the
+                // Prunes ignored and excluded directories from the watch itself, so their
+                // contents are never stat()ed or watched. dispatch() filters as well, for the
                 // events which chokidar reports before this can apply.
-                ignored: (path: string) => this.isIgnored(this.toRelativePath(path)),
+                ignored: (path: string) => {
+                    const relativePath = this.toRelativePath(path);
+                    return this.isIgnored(relativePath) || this.isExcludedPath(relativePath);
+                },
                 awaitWriteFinish: {
                     stabilityThreshold: 500,
                 },
@@ -1598,7 +1691,7 @@ export class PeerStorage extends Peer {
         const changed = async (path: string) => {
             if (!isCurrent()) return;
             const ePath = this.toRelativePath(path);
-            if (this.isIgnored(ePath)) return;
+            if (this.isIgnored(ePath) || this.isExcludedPath(ePath)) return;
             try {
                 if (await this.isChanged(ePath, access) && isCurrent()) await this.dispatch(path, access, isCurrent);
             } catch (error) {
@@ -1612,8 +1705,8 @@ export class PeerStorage extends Peer {
         watcher.on("unlink", async (path) => {
             if (!isCurrent()) return;
             const ePath = this.toPosixPath(relative(this.toLocalPath("."), path));
-            if (this.isIgnored(ePath)) {
-                this.debugLog(`${ePath} ignored`);
+            if (this.isIgnored(ePath) || this.isExcludedPath(ePath)) {
+                this.debugLog(`${ePath} ignored or excluded`);
                 return;
             }
             // Confirm that the path is absent before propagating a deletion.

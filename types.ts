@@ -23,6 +23,18 @@ export interface PeerStorageConf extends PeerPathIdentityConf {
     useChokidar?: boolean;
     /** Glob patterns for paths which are never synchronised, e.g. [".git/**"] */
     ignore?: string[];
+    /**
+     * File and folder names left out of synchronisation in both directions, at any depth: a path
+     * with a segment equal to one of these is neither sent nor written nor deleted here.
+     * Default: ["@eaDir", "#recycle", "#snapshot"] (folders a Synology NAS creates by itself).
+     * Giving a list replaces the default; [] excludes no name.
+     */
+    excludeNames?: string[];
+    /**
+     * Also leave out every name starting with "." (.obsidian, .trash, ...) in both directions, at
+     * any depth. Default: true. Excluded paths win over a CouchDB peer's `includeInternal`.
+     */
+    excludeDotNames?: boolean;
     handleFilenameCaseSensitive?: boolean;
     /**
      * Periodic rescan of the whole folder as a safety net for changes the watcher missed, in

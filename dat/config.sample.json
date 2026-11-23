@@ -49,6 +49,8 @@
             },
             "scanOfflineChanges": true,
             "ignore": ["**/.git/**", "node_modules/**"],
+            "excludeNames": ["@eaDir", "#recycle", "#snapshot"],
+            "excludeDotNames": true,
             "useChokidar": true
         }
     ]

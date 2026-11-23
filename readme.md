@@ -340,7 +340,9 @@ below leaves hidden-file synchronisation disabled. To opt in, see
         // $filename and $mode have been set also in environment variables.
       },
       "scanOfflineChanges": true,
-      "ignore": ["**/.git/**", "node_modules/**"], // Glob patterns which are never synchronised. Omit to synchronise everything.
+      "ignore": ["**/.git/**", "node_modules/**"], // Glob patterns which are never sent. Omit to send everything.
+      "excludeNames": ["@eaDir", "#recycle", "#snapshot"], // Names left out in both directions, at any depth. This is the default.
+      "excludeDotNames": true, // Also leave out every name starting with ".", in both directions. This is the default.
       "useChokidar":false, // Use Chokidar instead of Deno.watchFs; see filesystem watcher limitations.
       "maxConcurrentSends": 10, // Files read and sent at the same time (default 10).
       "rescanIntervalMinutes": 60, // Periodic rescan for missed changes (default 60, randomised to 3/4..5/4; 0 disables).
@@ -516,8 +518,18 @@ Each CouchDB peer applies its own `includeInternal` patterns in both directions.
 Opting one peer in does not enable another peer. Each Obsidian client that
 should synchronise these files also needs hidden-file synchronisation enabled
 in its own LiveSync settings. An excluded hidden file has no ordinary fallback
-route. Storage peers' sending exclusions remain separate; see
+route. Storage peers' exclusions remain separate; see
 [Excluding paths from a storage peer](#excluding-paths-from-a-storage-peer).
+
+A storage peer leaves every name starting with a dot out by default
+(`excludeDotNames`), in both directions. When the exclusion and `includeInternal`
+disagree, **the exclusion wins**: with the default, the files `includeInternal`
+selects are neither sent from nor written to a storage peer of the same group, and
+the bridge says so in a notice at start. To synchronise them through a storage peer
+as well, set `"excludeDotNames": false` on that storage peer (and remove any
+dot-named entry from its `excludeNames`). Note that this lets that storage peer
+send dot names below the top level as well; use `ignore` to keep some of them
+back.
 
 On CouchDB peers, shared paths beginning with a dot are reserved for this
 internal route. Ordinary documents such as `blog/.claude/settings.json` are
@@ -570,7 +582,69 @@ for live additions, changes and deletions.
 Note that `ignore` only stops a storage peer from *sending* its own changes.
 Incoming changes from other peers are still accepted: a file which another peer
 sends is still written, and a deletion which another peer sends is still
-applied, even at an excluded path.
+applied, even at an excluded path. To keep paths out in both directions, use
+`excludeNames` and `excludeDotNames`, described next.
+
+### Leaving names out in both directions: `excludeNames` and `excludeDotNames`
+
+Two further optional fields of a storage peer leave paths out of synchronisation
+in **both** directions. They need no configuration: when the keys are absent,
+the defaults below apply and the exclusion is on.
+
+```jsonc
+{
+  "type": "storage",
+  "name": "storage-test1",
+  "baseDir": "./vault/",
+  "excludeNames": ["@eaDir", "#recycle", "#snapshot"], // the default
+  "excludeDotNames": true // the default
+}
+```
+
+- `excludeNames` is an array of file or folder names. The default is `["@eaDir",
+  "#recycle", "#snapshot"]`, the folders a Synology NAS creates inside a shared
+  folder (thumbnails, recycle bin, snapshot view). Giving a list *replaces* the
+  default, so repeat the Synology names if you still want them; `[]` excludes no
+  name. An entry is a single name and cannot contain `/`.
+- `excludeDotNames` (default `true`) also excludes every name that starts with a
+  dot, such as `.obsidian`, `.trash` or `.sync-canary`.
+
+A path is excluded when **any** of its path segments equals one of the names, or,
+with `excludeDotNames`, starts with a dot, at any depth: `@eaDir/x.jpg`,
+`A/@eaDir/x.jpg`, `.obsidian/app.json` and `A/.trash/x.md` are excluded, while
+`@mention.md` and `#tag.md` are not (names are compared as whole segments, and
+exactly, so `@EADIR` is a different name; with `pathNormalizationVersion` 1 they
+are compared as the peer compares paths, normalised and, unless
+`handleFilenameCaseSensitive` is on, without regard to case).
+
+Unlike `ignore`, which only stops a storage peer from sending, an excluded path is
+left alone in both directions:
+
+- The start-up scan, the periodic rescan and the new-folder rescan do not send it,
+  and do not descend into an excluded folder (no extra calls per file are made).
+  The live watcher, `Deno.watchFs` or Chokidar, does not send creations, changes or
+  deletions of it either. (`Deno.watchFs` cannot be told to skip a tree, so its
+  events are dropped without looking at the files.)
+- A change arriving from another peer is neither written nor deleted on disk:
+  not a write, not a deletion, and not a move. Such a change is treated as
+  handled. It is answered with `false` ("nothing applied") and is not an error, so
+  the hub reports no failed delivery and the sending peer does not retry it.
+- A move (rename) arriving from another peer whose *new* path is excluded is not
+  carried out, and the file at the old path is kept (it is not removed, since the
+  new file was not stored). A move whose *old* path is excluded stores the file
+  at the new path and leaves the excluded path alone.
+- If a file is moved on the storage peer itself between an excluded and a normal
+  name, the other peers see a deletion (out of the normal name) or a new file (into
+  it); nothing is sent for the excluded side.
+
+Files that were already synchronised before a name became excluded are neither
+removed nor updated afterwards; they simply are no longer kept in step. A file on
+disk is never deleted by the exclusion itself.
+
+`ignore` keeps working as before and is applied in addition to these names.
+
+For a CouchDB peer's `includeInternal`, the exclusion wins; see
+[Synchronising internal/hidden files](#synchronising-internalhidden-files).
 
 ## Realistic example
 

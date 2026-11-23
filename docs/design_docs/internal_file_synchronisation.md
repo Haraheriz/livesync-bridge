@@ -170,6 +170,12 @@ stop sending local changes, while incoming writes and deletions remain accepted.
 They do not replace a CouchDB peer's `includeInternal` selection.
 Storage-to-storage changes do not acquire a CouchDB policy.
 
+A storage peer's `excludeNames` and `excludeDotNames` act in both directions and
+take precedence over `includeInternal`: with the default `excludeDotNames: true`,
+selected hidden files are neither sent from nor written to that storage peer.
+Where the selection is meant to reach a storage peer, the user sets
+`excludeDotNames: false` on it. The Hub reports the conflict once at start.
+
 A delayed storage write reads the current file content after waiting in the
 outgoing queue and its notification delay. An incoming update or deletion
 completed during that wait supersedes the earlier notification. The existing

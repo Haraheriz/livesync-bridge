@@ -136,6 +136,8 @@ async function withFixture(
         baseDir: `${baseDir}/`,
         scanOfflineChanges: true,
         useChokidar: false,
+        // A test synchronises hidden .claude files; dot names are left out by default.
+        excludeDotNames: false,
     };
     const hub = new Hub({ peers: [remoteConfig, storageConfig] });
     let databaseCreated = false;

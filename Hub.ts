@@ -1,9 +1,37 @@
-import { Config, FileData } from "./types.ts";
+import { Config, FileData, isCouchDBPeer, isStoragePeer } from "./types.ts";
 import { FileChangeContext, Peer, PeerHealth } from "./Peer.ts";
-import { PeerStorage } from "./PeerStorage.ts";
+import { DEFAULT_EXCLUDE_NAMES, PeerStorage } from "./PeerStorage.ts";
+import { Logger, LOG_LEVEL_NOTICE } from "octagonal-wheels/common/logger";
 import { PeerCouchDB } from "./PeerCouchDB.ts";
 import { validatePeerPathIdentity } from "./pathIdentity.ts";
 
+// A CouchDB peer's `includeInternal` selects hidden files (".claude/**"), but a storage peer of
+// the same group leaves names starting with "." out in both directions by default
+// (excludeDotNames), and the exclusion wins: those files are neither sent from nor written to
+// that storage peer. Returns one notice per such pair, so that the two settings do not cancel
+// each other silently.
+export function internalFileExclusionNotices(conf: Config): string[] {
+    const notices: string[] = [];
+    for (const couchdb of conf.peers) {
+        if (!isCouchDBPeer(couchdb) || (couchdb.includeInternal?.length ?? 0) === 0) continue;
+        for (const storage of conf.peers) {
+            if (!isStoragePeer(storage) || (storage.group ?? "") !== (couchdb.group ?? "")) continue;
+            const dotNames = storage.excludeDotNames ?? true;
+            const namedDots = (storage.excludeNames ?? DEFAULT_EXCLUDE_NAMES).filter((name) => name.startsWith("."));
+            if (!dotNames && namedDots.length === 0) continue;
+            const reason = dotNames
+                ? `excludeDotNames is on (the default)`
+                : `excludeNames holds ${namedDots.map((name) => `"${name}"`).join(", ")}`;
+            notices.push(
+                `Peer "${couchdb.name}" selects hidden files with includeInternal, but storage peer "${storage.name}" ` +
+                    `leaves them out because ${reason}: they are neither sent from nor written to "${storage.name}". ` +
+                    `The exclusion wins. To synchronise them, set "excludeDotNames": false` +
+                    `${namedDots.length ? " and remove those names from excludeNames" : ""} on "${storage.name}".`,
+            );
+        }
+    }
+    return notices;
+}
 
 export class Hub {
     conf: Config;
@@ -23,6 +51,7 @@ export class Hub {
     }
     start() {
         validatePeerPathIdentity(this.conf);
+        for (const notice of internalFileExclusionNotices(this.conf)) Logger(notice, LOG_LEVEL_NOTICE);
         for (const p of this.peers) {
             p.stop();
         }

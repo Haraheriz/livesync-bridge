@@ -235,6 +235,8 @@ for (const baseDir of ["", "blog/"]) {
                     baseDir: basePath + "/",
                     scanOfflineChanges: false,
                     useChokidar,
+                    // Hidden .claude files are synchronised here; dot names are left out by default.
+                    excludeDotNames: false,
                 };
                 const hub = new Hub({ peers: [remoteConfig, storageConfig] });
                 let writer: DirectFileManipulator | undefined;

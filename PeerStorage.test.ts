@@ -38,6 +38,11 @@ function makePeer(baseDir: string, useChokidar = false) {
         baseDir,
         scanOfflineChanges: false,
         useChokidar,
+        // The tests of this file use dot names (.git, .claude, ..\draft.md) to test `ignore`, the
+        // watchers and the write path. Dot names are left out by default, which has its own
+        // tests (PeerStorage.exclude.test.ts); here the rule is off so these tests keep testing
+        // what they were written for.
+        excludeDotNames: false,
     };
     const peer = new PeerStorage(config, async () => {});
     keepRecordsInMemory(peer);
@@ -54,6 +59,7 @@ function makeRecordingPeer(baseDir: string, extra: Partial<PeerStorageConf> = {}
         baseDir,
         scanOfflineChanges: false,
         useChokidar: false,
+        excludeDotNames: false, // see makePeer
         ...extra,
     };
     const peer = new PeerStorage(config, (_source, path, data) => {

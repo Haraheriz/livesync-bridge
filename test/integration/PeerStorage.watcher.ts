@@ -286,6 +286,8 @@ function makeHarness(
     baseDir,
     scanOfflineChanges: options.scanOfflineChanges ?? false,
     useChokidar,
+    // Some tests of this harness synchronise hidden .claude files; dot names are left out by default.
+    excludeDotNames: false,
     ...(options.ignore ? { ignore: options.ignore } : {}),
   };
   const trace: WatcherTrace | undefined =

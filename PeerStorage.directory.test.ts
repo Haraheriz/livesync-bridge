@@ -24,7 +24,9 @@ function contents(text: string): FileData {
 }
 function storage(baseDir: string) {
     const events: { path: string; data: FileData | false }[] = [];
-    const peer = new PeerStorage({ type: "storage", name: crypto.randomUUID(), baseDir, ignore: ["**/private"] },
+    // The subtrees below are named .claude; dot names are left out by default (excludeDotNames),
+    // which has its own tests (PeerStorage.exclude.test.ts), so the rule is off here.
+    const peer = new PeerStorage({ type: "storage", name: crypto.randomUUID(), baseDir, ignore: ["**/private"], excludeDotNames: false },
         (_source, path, data) => { events.push({ path, data }); return Promise.resolve(); });
     const settings = new Map<string, string>();
     peer.getSetting = (key) => Promise.resolve(settings.get(key) ?? null);

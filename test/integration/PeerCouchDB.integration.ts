@@ -400,6 +400,8 @@ for (const baseDir of ["", "blog/"]) {
                     name: `internal-storage-${suffix}`,
                     baseDir: tempDir,
                     scanOfflineChanges: false,
+                    // Hidden .claude files are synchronised here; dot names are left out by default.
+                    excludeDotNames: false,
                 }, dispatch);
                 for (const instance of [peer, storage]) {
                     const settings = new Map<string, string>();
