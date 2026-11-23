@@ -1,4 +1,5 @@
-import { dirname, join } from "@std/path";
+import { dirname, join, resolve } from "@std/path";
+import { DatabaseSync } from "node:sqlite";
 import { createSqliteFileValueStore, type SqliteValueStore } from "@vrtmrz/value-store/node-sqlite";
 import { Logger, LOG_LEVEL_INFO, LOG_LEVEL_NOTICE } from "octagonal-wheels/common/logger";
 
@@ -18,6 +19,8 @@ export interface LegacyKeyValueSource {
 }
 
 const IMPORT_MARKER = "imported-local-storage";
+const NAS_IMPORT_MARKER = "imported-nas-settings";
+const NAS_SETTINGS_FILE = "lsb-settings.sqlite";
 const IMPORT_CHUNK = 1000;
 const WRITE_BATCH_SIZE = 1000;
 const DEFERRED_DELAY_MS = 500;
@@ -53,6 +56,78 @@ export function defaultStateFile(env: (key: string) => string | undefined = (key
 export function errorCode(ex: unknown): string {
     const code = (ex as { code?: unknown } | null)?.code;
     return typeof code === "string" ? code : `${ex}`;
+}
+
+// The earlier NAS build kept peer records in `lsb-settings.sqlite` (table
+// settings(k TEXT PRIMARY KEY, v TEXT NOT NULL)) under the same keys that
+// Peer._getKey() builds today: `<name>-<type>-<baseDir>-<key>`.
+//
+// Only the per-file records of storage peers are carried over:
+//   <name>-storage-<baseDir>-file-stat-<path>  ->  "<mtime>-<size>"
+// Their key and value are identical in this version (PeerStorage.fileStatKey()
+// without NFC identity, and the "mtime-size" stamp), so they are copied as they
+// are. Everything else is left behind on purpose:
+//   - `since` / `remote-created`: the old key names no remote (this version
+//     binds a position to URL and database and does not trust an unbound one),
+//     and the old build advanced `since` past documents whose content could
+//     not be loaded yet, which it kept in a separate persisted retry queue
+//     (`pending-loads`) that this version does not have. Without that queue
+//     the position could skip changes, so the feed is read from the start.
+//   - `pending-loads`, `since-override-applied`, the old build's own marker
+//     and anything unknown.
+const NAS_FILE_STAT_KEY = /^.+-storage-.*-file-stat-.+$/s;
+const FILE_STAMP = /^\d+-\d+$/;
+
+export function isNasFileRecord(key: string, value: unknown): value is string {
+    return typeof value === "string" && NAS_FILE_STAT_KEY.test(key) && FILE_STAMP.test(value);
+}
+
+// Where the earlier NAS build kept its settings, in the order they are tried:
+// LSB_SETTINGS_DB (the old build's own override), then the directory of the
+// state file (the old build used the same directory by default).
+export function nasSettingsCandidates(
+    stateFile: string,
+    env: (key: string) => string | undefined = (key) => Deno.env.get(key),
+): string[] {
+    const candidates: string[] = [];
+    const explicit = env("LSB_SETTINGS_DB");
+    if (explicit) candidates.push(explicit);
+    candidates.push(join(dirname(stateFile), NAS_SETTINGS_FILE));
+    return candidates;
+}
+
+function isFile(path: string): boolean {
+    try {
+        return Deno.statSync(path).isFile;
+    } catch {
+        return false;
+    }
+}
+
+export interface NasImportResult {
+    // File records offered to the state (records it already had are kept).
+    imported: number;
+    // Entries of the old file that are not carried over.
+    skipped: number;
+}
+
+// Read the old file without modifying it. It is opened read-only, so that the
+// write-ahead log is read as well; SQLite may create the empty -wal / -shm
+// files next to it, but never changes the database or the log.
+function readNasSettings(path: string): { records: [string, string][]; skipped: number } {
+    const database = new DatabaseSync(path, { readOnly: true });
+    try {
+        const rows = database.prepare("SELECT k, v FROM settings").all() as { k: unknown; v: unknown }[];
+        const records: [string, string][] = [];
+        let skipped = 0;
+        for (const { k, v } of rows) {
+            if (typeof k === "string" && isNasFileRecord(k, v)) records.push([k, v]);
+            else skipped++;
+        }
+        return { records, skipped };
+    } finally {
+        database.close();
+    }
 }
 
 export class PeerState {
@@ -200,12 +275,36 @@ export class PeerState {
         await this.meta.setValue(IMPORT_MARKER, "done");
         return snapshot.length;
     }
-    // Forget all state. The marker is written first so that old localStorage
-    // entries are never imported again afterwards. Stop all peers before calling.
+    // Copy the file records of the earlier NAS build once (see NAS_FILE_STAT_KEY
+    // above). Entries already in the state file win, and the old file is never
+    // modified, so the old build can still be started for a rollback. Returns
+    // undefined when there is nothing to do: already imported (or reset), or no
+    // old file. A failure leaves the marker unset, so the next start retries.
+    async importNasSettings(candidates: readonly string[]): Promise<NasImportResult | undefined> {
+        if (await this.meta.getValue(NAS_IMPORT_MARKER) !== null) return undefined;
+        const own = resolve(this.path);
+        const source = candidates.find((candidate) => resolve(candidate) !== own && isFile(candidate));
+        if (source === undefined) return undefined;
+        const { records, skipped } = readNasSettings(source);
+        for (let i = 0; i < records.length; i += IMPORT_CHUNK) {
+            await this.state.writeBatch(records.slice(i, i + IMPORT_CHUNK).map(([key, value]) => ({
+                type: "setValue" as const,
+                key,
+                value,
+                ifAbsent: true,
+            })));
+        }
+        await this.meta.setValue(NAS_IMPORT_MARKER, "done");
+        return { imported: records.length, skipped };
+    }
+    // Forget all state. The markers are written first so that old localStorage
+    // entries and the earlier NAS build's file are never imported again
+    // afterwards (neither is deleted). Stop all peers before calling.
     async reset(): Promise<void> {
         // Records queued before the reset must not reappear after it.
         await this.flush();
         await this.meta.setValue(IMPORT_MARKER, "reset");
+        await this.meta.setValue(NAS_IMPORT_MARKER, "reset");
         await this.state.clear();
     }
     async dispose(): Promise<void> {
@@ -236,8 +335,33 @@ export interface InitPeerStateOptions {
     reset?: boolean;
     // Where to import earlier entries from. Defaults to the global localStorage.
     legacy?: LegacyKeyValueSource | undefined;
+    // Settings file of the earlier NAS build to import once. Defaults to
+    // LSB_SETTINGS_DB, then lsb-settings.sqlite next to the state file;
+    // `false` turns the import off.
+    nasSettings?: string | false;
     // Tuning and error reporting for the write queue (mainly for tests).
     queue?: PeerStateOptions;
+}
+
+// An unreadable old file must not stop the bridge: it starts with whatever the
+// state already holds (an empty state sends every file again), and tries the
+// import again at the next start.
+async function importNasSettings(state: PeerState, option: string | false | undefined): Promise<void> {
+    if (option === false) return;
+    try {
+        const result = await state.importNasSettings(option === undefined ? nasSettingsCandidates(state.path) : [option]);
+        if (result) {
+            Logger(
+                `Imported ${result.imported} file records from the earlier NAS build's settings file; ${result.skipped} other entries not carried over`,
+                LOG_LEVEL_INFO,
+            );
+        }
+    } catch (ex) {
+        Logger(
+            `Could not read the earlier NAS build's settings file, so its file records are not imported (${ex instanceof Error ? ex.message : ex}). Every file may be treated as changed. It is tried again at the next start.`,
+            LOG_LEVEL_NOTICE,
+        );
+    }
 }
 
 // Prepare the shared state. Await this before starting any peer.
@@ -250,6 +374,10 @@ export async function initPeerState(options: InitPeerStateOptions = {}): Promise
             // Clear the legacy source as well, so the next start has nothing to import.
             (legacy as Storage | undefined)?.clear?.();
         } else {
+            // The earlier NAS build moved its records out of localStorage and left
+            // that copy as it was, so its file is the newer one: import it first,
+            // and let it win over the localStorage entries.
+            await importNasSettings(state, options.nasSettings);
             const copied = await state.importLegacy(legacy);
             if (copied > 0) Logger(`Copied ${copied} entries from localStorage to ${state.path}`, LOG_LEVEL_INFO);
         }

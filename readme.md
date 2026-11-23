@@ -177,6 +177,18 @@ reached that limit, after which files were no longer sent. Existing
 start (entries already in the state file are kept, and `localStorage` itself is
 left unchanged). `--reset` clears both the state file and `localStorage`.
 
+State written by the earlier NAS build in `lsb-settings.sqlite` (in the same
+directory as the state file, or the file named by `LSB_SETTINGS_DB`) is
+imported once, before the `localStorage` import: its per-file records are
+copied, so files that build had already sent are not sent again, and records
+already in the state file are kept. The old file is opened read-only and is left
+in place, so the earlier build can still be started. Its CouchDB resume
+position is not imported: the old key names no remote, and that build kept
+documents it had not been able to load in a separate retry queue, so a copied
+position could skip them. The changes feed is therefore read from the beginning
+on the first start. A file that cannot be read is reported and ignored, and the
+import is tried again at the next start. `--reset` prevents the import for good.
+
 If a file record cannot be saved, the file is still sent and the failure code is
 logged; the next offline scan sends it again. If a CouchDB resume position
 cannot be saved, the position is not advanced and the change is read again after
