@@ -284,8 +284,8 @@ async function runScenario(variant: Variant, mode: "running" | "restart"): Promi
 
         // The writer; its first note creates the shared encryption parameters, which the reader must share.
         await writer.start();
-        const warmupBefore = await listIds(source);
-        assert(warmupBefore.length === 0, "Fixture: the source database must start empty");
+        // start() may already have written its own documents (version and milestone information),
+        // so the source is not required to be empty here; everything present after the warm-up is skipped.
         await writer.put(`warmup-${short}.md`, { ctime: 1, mtime: 1, size: 6, data: ["warmup"] });
         const skipped = new Set(await listIds(source)); // never copied: the reader must not see the warm-up note
         const parameters = await couch(`${source}/${PARAMETERS_ID}`);
