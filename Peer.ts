@@ -109,7 +109,9 @@ export abstract class Peer {
         if (result && previousPath !== path) await this.delete(previousPath);
         return result;
     }
-    cache = new LRUCache<string, string>(300, 10000000, true);
+    // Large enough for a bulk move: with 300 entries, the watcher events of the files this peer
+    // had itself written were taken for new changes once more than 300 files had gone through.
+    cache = new LRUCache<string, string>(20000, 10000000, true);
     protected pathIdentityKey(path: string, policy?: PathComparisonSettings): string {
         const snapshot = policy ?? {
             pathNormalizationVersion: getPeerPathNormalizationVersion(this.config),
@@ -144,6 +146,18 @@ export abstract class Peer {
                 this.pendingChanges.delete(key);
             }
         });
+    }
+    // A change which starts at a peer (a watcher event) is delivered to the other peers while this
+    // peer's per-path record is held, and each receiving peer then takes its own. Two peers which
+    // start a change of the same file at the same moment would each wait for the other's record
+    // for ever. Changes of one file are therefore started one at a time across all peers: every
+    // caller of applyChange() with suppressPendingEcho runs inside this lock, and reads what it
+    // is going to send inside it too, so that it sends the state left by the change before it.
+    // The key is the path as the hub sees it, without regard to a leading slash, letter case or
+    // Unicode form: too coarse a key only makes two unrelated files take turns.
+    protected async withOriginLock<T>(hubPath: string, proc: () => Promise<T>): Promise<T> {
+        const key = hubPath.normalize("NFC").toLowerCase().replace(/^\/+/, "");
+        return await serialized(`livesync-bridge:origin:${key}`, proc);
     }
     async isRepeating(path: string, data: FileData | false, policy?: PathComparisonSettings) {
         const key = this.pathIdentityKey(path, policy);

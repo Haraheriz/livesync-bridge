@@ -535,19 +535,21 @@ export class PeerCouchDB extends Peer {
             return;
         }
         // A rejected delivery is not recorded, so it stays eligible for the watcher's retry.
-        await this.applyChange(path, data, async () => {
-            await this.dispatchToHub(this, path, data);
-            return true;
-        }, { suppressPendingEcho: true });
+        await this.withOriginLock(path, () =>
+            this.applyChange(path, data, async () => {
+                await this.dispatchToHub(this, path, data);
+                return true;
+            }, { suppressPendingEcho: true }));
         // else {
         //     this.receiveLog(`${path} dispatch repeating`);
         // }
     }
     async dispatchDeleted(path: string) {
-        await this.applyChange(path, false, async () => {
-            await this.dispatchToHub(this, path, false);
-            return true;
-        }, { suppressPendingEcho: true });
+        await this.withOriginLock(path, () =>
+            this.applyChange(path, false, async () => {
+                await this.dispatchToHub(this, path, false);
+                return true;
+            }, { suppressPendingEcho: true }));
     }
     async stop(): Promise<void> {
         // `man` may not exist yet if stop() races a still-connecting start().

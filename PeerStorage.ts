@@ -729,7 +729,9 @@ export class PeerStorage extends Peer {
             await delay(250);
             if (!isCurrent()) return;
             // The file is read only when its turn comes, so waiting files hold nothing but their path.
-            await this.withSendSlot(async () => {
+            // It is read inside the origin lock: a change of the same file arriving from another
+            // peer is applied first, and what is read here is then the state it left.
+            await this.withSendSlot(() => this.withOriginLock(this.originKey(path, access), async () => {
                 if (!isCurrent()) return;
                 let data: FileData | false;
                 try {
@@ -785,8 +787,17 @@ export class PeerStorage extends Peer {
                     throw ex;
                 }
                 this.sendSucceeded(pathSrc, false);
-            });
+            }));
         });
+    }
+    // The hub's name for the path, for withOriginLock(). hubPath() can refuse a path; the
+    // delivery then fails at its own call, as before.
+    private originKey(path: string, access?: DenoStoragePathAccess): string {
+        try {
+            return this.hubPath(path, access);
+        } catch {
+            return path;
+        }
     }
     async dispatchDeleted(pathSrc: string, isCurrent = () => true) {
         if (this.stopped) return;
@@ -836,19 +847,29 @@ export class PeerStorage extends Peer {
                     return;
                 }
             }
+            let recreated = false;
             try {
-                await this.withSendSlot(() =>
-                    this.applyChange(path, false, async () => {
+                await this.withSendSlot(() => this.withOriginLock(this.originKey(path, access), async () => {
+                    // A write from another peer may have put the file back while this waited.
+                    if (!await this.isMissing(pathSrc, access)) {
+                        recreated = true;
+                        return false;
+                    }
+                    return await this.applyChange(path, false, async () => {
                         if (!isCurrent()) return false;
                         this.sendLog(`${path} delete detected`);
                         await this.dispatchToHub(this, this.hubPath(path, access), false);
                         return true;
-                    }, { suppressPendingEcho: true, policy: this.pathPolicy(access) })
-                );
+                    }, { suppressPendingEcho: true, policy: this.pathPolicy(access) });
+                }));
             } catch (ex) {
                 // The file stays known, so the next event on its folder reconciles it again.
                 this.sendFailed(pathSrc, true, retry, undefined, ex);
                 throw ex;
+            }
+            if (recreated) {
+                this.clearSendRetry(pathSrc, true);
+                return;
             }
             this.sendSucceeded(pathSrc, true);
             this.knownFiles.delete(resolve(pathSrc));
